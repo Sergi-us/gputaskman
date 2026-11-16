@@ -1185,7 +1185,13 @@ the previous reading is more than 60 s old; an idle server shows 0. They are lab
 server-level rates, not per worker or per GPU. `vllm:prompt_tokens_total` counts prompt tokens per
 sequence (with `n` parallel samples each prompt counts `n` times) and includes prefix-cache hits
 ([vllm#56361](https://github.com/vllm-project/vllm/issues/56361)), so the prompt rate is neither the
-tokens clients submitted nor the prefill tokens actually computed. Parent-discovered
+tokens clients submitted nor the prefill tokens actually computed.
+
+**Token rates need two fresh probes in the same running session.** The TUI and `gputaskman record`
+show them from the second probe onward; one-shot `--once` and `--json` output probe once, so their
+rates are always unavailable (`null`), not broken.
+
+Parent-discovered
 ports are **always unauthenticated**, even when parent and worker launch arguments match:
 the worker's key is never sent there. A 401 is shown as **Parent-process API locked**.
 Probe caches separate own/parent origins, process creation times, runtime and credentials, so
