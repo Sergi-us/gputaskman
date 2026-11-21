@@ -7,7 +7,7 @@ import json
 import os
 
 from .collector import ProcRow, Snapshot
-from .llm import LOG_HISTORY_LABEL, gb, log_buffer_text, server_gauge_text
+from .llm import LOG_HISTORY_LABEL, gb, log_buffer_text, server_gauge_text, vllm_rate_text
 from .nvml import format_metric
 from .pdh import ProcGpu
 from .tcc import TccAdapter
@@ -128,6 +128,15 @@ def vram_total_label(s: Snapshot) -> str:
     return gb(s.vram_total) if s.vram_total else "N/A"
 
 
+def _server_dict(server) -> dict:
+    """ServerInfo as JSON, without internal fields marked json=False (such as rate baselines)."""
+    out = dataclasses.asdict(server)
+    for f in dataclasses.fields(server):
+        if f.metadata.get("json", True) is False:
+            out.pop(f.name, None)
+    return out
+
+
 def to_dict(s: Snapshot) -> dict:
     nv = dataclasses.asdict(s.nv) if s.nv else None
     adapter = dataclasses.asdict(s.adapter) if s.adapter else None
@@ -173,9 +182,7 @@ def to_dict(s: Snapshot) -> dict:
         if p.handy:
             item["handy"] = dataclasses.asdict(p.handy)
         if p.llm:
-            server = dataclasses.asdict(p.llm.server) if p.llm.server else None
-            if server:
-                server.pop("models_complete")
+            server = _server_dict(p.llm.server) if p.llm.server else None
             item["llm"] = {
                 "models": [{"path": g.path, "name": g.name, "label": p.llm.label(i), "arch": g.arch, "kind": g.kind,
                             "kind_label": p.llm.kind_label(i),
@@ -330,7 +337,7 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
             busy = "n/a" if sv.slots_busy is None else str(sv.slots_busy)
             total_slots = "n/a" if sv.slots_total is None else str(sv.slots_total)
             out.append(f"   server: {sv.kind} {sv.url} ctx={sv.n_ctx} slots={busy}/{total_slots}"
-                       + (f" gen={sv.gen_tok_s:.1f} tok/s" if sv.gen_tok_s is not None else ""))
+                       + (f" gen={sv.gen_tok_s:.1f} tok/s" if sv.gen_tok_s is not None and sv.kind != "vllm" else ""))
             if p.llm.server_source == "parent":
                 out.append("   server source: parent process (API report, not worker residency)")
             if sv.kind in ("vllm", "foundry-local"):
@@ -338,6 +345,8 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
                     out.append(f"   API-reported model ID: {m['name']}")
             if gauges := server_gauge_text(sv):
                 out.append(f"   {gauges}")
+            if rates := vllm_rate_text(sv):
+                out.append(f"   {rates}")
         if p.llm.log:
             out.append(f"   {LOG_HISTORY_LABEL}: {p.llm.log_source}")
             out.extend(f"     {log_buffer_text(record, p.detail.create_time)}" for record in p.llm.log)
