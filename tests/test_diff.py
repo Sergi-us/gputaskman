@@ -47,6 +47,12 @@ def llm(n_ctx, kv, exact=False):
 
 
 class MatchTests(unittest.TestCase):
+    def test_unresolved_nvml_pids_are_not_paired_by_placeholder_name(self):
+        before = [proc(7, "(unresolved host PID)", host="nvml")]
+        after = [proc(9, "(unresolved host PID)", host="nvml")]
+        self.assertEqual({how for _, _, how in match(before, after)}, {"gone", "new"})
+        self.assertIn("H:9", to_text(diff(snap(before, 0, 0), snap(after, 0, 0))))
+
     def test_pid_then_name_and_ports_then_unique_name(self):
         before = [proc(1, "a.exe"), proc(2, "llama-server", ports=[8080]), proc(3, "solo.exe")]
         after = [proc(1, "a.exe"), proc(20, "llama-server", ports=[8080]), proc(30, "solo.exe")]
@@ -342,6 +348,55 @@ class LoadAndCliTests(unittest.TestCase):
         with open(path, "w", encoding=encoding) as f:
             f.write(json.dumps(data))
         return path
+
+    def test_cli_shows_process_memory_availability_changes(self):
+        labels = {
+            "vram_inferred_bytes": "inferred VRAM (WSL context match)",
+            "vram_bytes": None,
+            "shared_bytes": "shared memory",
+            "committed_bytes": "committed memory",
+            "paged_out_bytes": "paged-out memory",
+            "vram_resident_bytes": "resident VRAM",
+            "gtt_resident_bytes": "resident GTT",
+            "graphics_swapped_bytes": "compressed graphics (footprint swapped)",
+        }
+        for key, label in labels.items():
+            for b, a, left, right in ((None, 3 * GiB, "N/A", "3.00 GB"), (3 * GiB, None, "3.00 GB", "N/A"),
+                                      (None, 0, "N/A", "0 MB"), (0, None, "0 MB", "N/A")):
+                with self.subTest(counter=key, before=b, after=a):
+                    pair = proc(42, "same-process", started=99.0)
+                    before = self.write("before.json", snap([{**pair, key: b}], GiB, GiB), "utf-8")
+                    after = self.write("after.json", snap([{**pair, key: a}], GiB, GiB), "utf-8")
+                    args = ["gputaskman", "diff", before, after]
+                    out = io.StringIO()
+                    with patch("sys.argv", args), contextlib.redirect_stdout(out):
+                        main()
+                    text = out.getvalue()
+                    self.assertRegex(text, r"(?m)^same-process\s+42  pid\b")
+                    if label:
+                        self.assertIn(f"{label}  {left} -> {right}  N/A", text)
+                    else:
+                        self.assertRegex(text, rf"(?m)^same-process\s+42  pid\s+{left}\s+{right}\s+N/A")
+                    self.assertNotIn("no process changed", text)
+                    out = io.StringIO()
+                    with patch("sys.argv", [*args, "--json"]), contextlib.redirect_stdout(out):
+                        main()
+                    result = json.loads(out.getvalue())
+                    row, = result["processes"]
+                    group = "inferred" if key == "vram_inferred_bytes" else "measured"
+                    self.assertEqual(row[group][key], {"before": b, "after": a, "delta": None})
+                    if group == "inferred":
+                        self.assertEqual(row["measured"]["vram_bytes"], {"before": None, "after": None, "delta": None})
+                        self.assertEqual(result["device"]["attributed"]["delta"], 0)
+
+    def test_unchanged_and_small_numeric_process_counters_stay_hidden(self):
+        for field in ("vram_bytes", "vram_inferred_bytes"):
+            for before, after in ((None, None), (0, 0), (0, 16 * MiB - 1), (0, 16 * MiB)):
+                with self.subTest(counter=field, before=before, after=after):
+                    row = proc(42, "same-process", started=99.0)
+                    d = diff(snap([{**row, field: before}], GiB, GiB),
+                             snap([{**row, field: after}], GiB, GiB))
+                    self.assertEqual("same-process" in to_text(d), after == 16 * MiB)
 
     def test_reads_powershell_utf16_and_utf8_bom(self):
         data = snap([proc(1, "a", vram=MiB)], used=MiB, attributed=MiB)

@@ -10,7 +10,7 @@ from contextlib import ExitStack
 
 import psutil
 
-from .amdsmi import AmdSmi, _bdf, amdsmi_status
+from .amdsmi import AmdSmi, amdsmi_status
 from .adl import Adl
 from .dxgi import (VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, VENDOR_QUALCOMM, Adapter,
                   adapter_driver_version)
@@ -18,9 +18,9 @@ from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path
 from . import nvml as nvml_mod
 from .nvml import Nvml, NvDevice
-from .pdh import ProcGpu
+from .pdh import ENGINE_UNAVAILABLE_REASON, ProcGpu
 from .procinfo import AI_KINDS, ProcDetail, ProcInspector, classify
-from .tcc import TccAdapter, TccCounters, tcc_adapters
+from .tcc import TccAdapter, TccCounters, _pci_identity, tcc_adapters
 from .telemetry import DeviceTelemetry
 
 if sys.platform == "win32":
@@ -59,7 +59,7 @@ class ProcRow:
     llm: LlmView | None = None
     handy: HandyEvidence | None = None
     host: bool = False  # pid is from another PID namespace, never a local one (see origin)
-    origin: str = ""  # with host: "windows" (a Windows process seen from WSL) | "outside" (outside this container)
+    origin: str = ""  # with host: "windows" | "outside" (legacy) | "nvml" (host PID, local owner unresolved)
     gpu_index: int | None = None
     ram: int | None = None  # system RAM (working set) from host.py; None = unknown, not zero
     cpu: float | None = None  # % of the whole machine from host.py; None until the second sample
@@ -138,8 +138,7 @@ class Snapshot:
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
     # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.
     shared_is_spill: bool = True
-    counter_status: str = ""  # Windows counter availability or adapter matching problem;
-    # Intel DRM privilege explanation (needs root) when its load/video/power are N/A
+    counter_status: str = ""  # Counter availability or adapter matching explanation
     counter_adapter_matched: bool | None = None  # Windows PDH LUID matched the selected DXGI adapter
     process_memory_available: bool = True
     nv_lost: bool = False  # NVML faulted for this GPU after a disable/re-enable; restart restores it
@@ -150,9 +149,10 @@ class Snapshot:
     @property
     def attributed(self) -> int | None:
         if not self.process_memory_available or self.counter_adapter_matched is False or any(
-                "dedicated" not in p.gpu.available for p in self.procs):
+                ("dedicated" not in p.gpu.available or (self.backend == "nvml" and not p.gpu.attributed))
+                for p in self.procs if not p.gpu.inferred_by):
             return None
-        total = int(sum(p.gpu.dedicated for p in self.procs))
+        total = int(sum(p.gpu.dedicated for p in self.procs if p.gpu.attributed))
         if self.backend == "wsl" and self.host_data and self.vram_total and total > self.vram_total:
             return None  # overlapping host counters cannot establish uniquely attributed bytes
         return total
@@ -162,6 +162,7 @@ def _is_live(g: ProcGpu) -> bool:
     # graphics_swapped is macOS compressed graphics memory and is not added to dedicated.
     return (
         bool(g.engine_reason) or not g.attributed or g.dedicated >= MiB or g.gpu_pct >= 0.5
+        or (g.wddm_dedicated_usage or 0) >= MiB or (g.wddm_shared_usage or 0) >= 16 * MiB
         or g.shared >= 16 * MiB or g.paged_out >= 16 * MiB or (g.graphics_swapped or 0) >= 16 * MiB
     )
 
@@ -184,6 +185,16 @@ def ordered_adapters(adapters: list[Adapter]) -> list[Adapter]:
                   key=lambda a: (isinstance(a, TccAdapter), a.vendor_id != VENDOR_NVIDIA, -a.dedicated_vram, a.luid))
 
 
+def _wddm_bdf(pci_bus) -> tuple[int, int, int] | None:
+    """An NVML PCI address in WDDM's ADAPTERADDRESS form. Windows puts the PCI segment above the 8-bit
+    bus (segment 15 bus 1 is bus 0xF01), so domain-0 addresses are unchanged."""
+    identity = _pci_identity(pci_bus)
+    if identity is None:
+        return None
+    domain, (bus, device, function) = identity
+    return domain << 8 | bus, device, function
+
+
 def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index: int,
                      adapters: list[Adapter] | None = None) -> NvDevice | None:
     if adapter:
@@ -203,7 +214,7 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
         if adapters is not None and sum(a.pci_address == adapter.pci_address for a in adapters
                                         if not (isinstance(a, TccAdapter) and a.driver_model == "MCDM")) != 1:
             return None
-        matches = [d for d in devices if _bdf(d.pci_bus) == adapter.pci_address and d.driver_model != "MCDM"]
+        matches = [d for d in devices if _wddm_bdf(d.pci_bus) == adapter.pci_address and d.driver_model != "MCDM"]
         if len(matches) == 1:
             return matches[0]
         return None
@@ -216,19 +227,23 @@ def _llm_wanted(row, shared_is_spill: bool) -> bool:
     not diffusion, and with measured GPU memory. Where spilled system memory is a counter of its own
     (WDDM, discrete DRM cards) both the dedicated and shared counters must be present; on an integrated
     GPU system memory is the memory and there is no spill counter, so dedicated alone suffices.
-    Foundry Local can report loaded IDs even when memory counters and model files are unavailable."""
+    Independent model evidence or a recognized LLM runtime can still supply metadata or API discovery
+    on an inferred-owner row, without a measured memory budget. Foundry Local can report loaded IDs
+    without counters or files."""
     if row.detail.is_diffusion:
         return False
     if row.detail.foundry_local:
         return True  # Loaded-model identity does not require memory counters or a mapped file.
     if row.kind not in AI_KINDS or not (row.detail.has_model_evidence or row.kind == "LLM"):
         return False
+    if not row.gpu.attributed and row.gpu.inferred_by:
+        return True
     need = {"dedicated", "shared"} if shared_is_spill else {"dedicated"}
     return need <= row.gpu.available
 
 
 class Collector:
-    DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
+    DEEP_TOP_N = 25  # budgeted scans: the top N VRAM users plus anything busy
     _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
     drm_card = None  # the selected GPU's AMD or Intel card, when it is one (drm.DrmCard)
@@ -291,7 +306,7 @@ class Collector:
                 self.counters.ascend = self.ascend
         self.inspector = ProcInspector()
         self.prober = ServerProber()
-        self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
+        self.scan_budget = scan_budget  # None = scan every eligible local process now (one-shot output)
         self.gpu_index = gpu_index
         # WSL: Linux can't see WSL's own VRAM, but the Windows host can. Ask it when interop is enabled.
         self.host: HostStream | None = None
@@ -410,7 +425,19 @@ class Collector:
             shared_is_spill=not (integrated_gpu or (self.drm_card is not None and self.drm_card.integrated)),
         )
 
+        fallbacks = getattr(self.counters, "fallback_counters", None)
+        missing_dedicated = getattr(self.counters, "dedicated_counter_missing", False) is True
+        if BACKEND == "wddm" and (missing_dedicated or
+                                  (isinstance(fallbacks, set) and "dedicated" in fallbacks)):
+            snap.process_memory_available = False
+        if BACKEND == "metal" and self.counters.hidden_unmeasured:
+            snap.process_memory_available = False
+            snap.counter_status = "Attributed GPU memory is unknown: some idle Metal clients have unmeasured memory."
+
         snap.host_status = self.host_status
+        if BACKEND == "metal" and not self.counters.process_available:
+            snap.process_memory_available = False
+            snap.counter_status = "Metal client query failed; per-process GPU readings are unavailable."
         if BACKEND == "wsl" and (not self.adapter or self.adapter.vendor_id == VENDOR_AMD):
             snap.counter_status = " ".join(dict.fromkeys(filter(None, (amdsmi_status(), self.amdsmi.status))))
             if self.adapter is None:
@@ -431,12 +458,24 @@ class Collector:
                 snap.counter_status = ("Some Windows adapter memory counters are unavailable; "
                                        "GPU-PV VMs may not expose them.")
             if (nv is None and self.adapter.vendor_id == VENDOR_NVIDIA and self.adapter.pci_address
-                    and any(_bdf(b) == self.adapter.pci_address for b in nvml_mod.LOST)):
+                    and any(_wddm_bdf(b) == self.adapter.pci_address for b in nvml_mod.LOST)):
                 snap.nv_lost = True
                 snap.counter_status = " ".join(filter(None, (
                     snap.counter_status, "NVIDIA telemetry stopped after this GPU was re-enabled; "
                                          "restart gputaskman to restore it.")))
             snap.counter_status = " ".join(filter(None, (snap.counter_status, self.adapter.identity_status)))
+            if isinstance(fallbacks, set) and fallbacks:
+                snap.counter_status = " ".join(filter(None, (
+                    snap.counter_status, "Windows fallback process memory counters may overlap across processes; "
+                    "charged memory and Paged are unavailable for affected counters.")))
+            if missing_dedicated:
+                snap.counter_status = " ".join(filter(None, (
+                    snap.counter_status, "Windows per-process dedicated memory counters are unavailable; "
+                    "attributed VRAM is unknown.")))
+            if getattr(self.counters, "shared_counter_missing", False) is True:
+                snap.counter_status = " ".join(filter(None, (
+                    snap.counter_status, "Windows per-process shared memory counters are unavailable; "
+                    "shared memory and Paged are unknown.")))
         if self.drm_card is not None:
             snap.process_status = self.counters.drm.status
             if self.drm_card.intel and nv is not None:
@@ -449,20 +488,25 @@ class Collector:
         elif self.backend == "ascend":
             snap.process_memory_available = False
             snap.counter_status = "Ascend chip unavailable: npu-smi could not match the selected adapter"
+        if self.backend == "nvml":
+            process_status = getattr(self.counters, "process_status", {})
+            process_status = process_status.get(luid, "") if isinstance(process_status, dict) else ""
+            if process_status:
+                snap.process_memory_available = False
+                snap.counter_status = process_status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g) or pid in integrated_local_pids]
-        live.sort(key=lambda x: -(x[1].shown_vram or 0))
+        live.sort(key=lambda x: -(x[1].shown_vram or x[1].wddm_dedicated_usage or 0))
         for pid, g in live:
             d = self.inspector.get(pid)
             row = ProcRow(pid=pid, name=d.name, kind=classify(d, g.engines), gpu=g, detail=d)
             snap.procs.append(row)
 
-        for pid, g in getattr(self.counters, "outside", {}).get(luid, {}).items():
-            # A container sees the host's PIDs from NVML; unmatched ones are other containers or the host.
-            snap.procs.append(ProcRow(pid, "(outside this container)", "external", g,
-                                      ProcDetail(pid, "(outside this container)"), host=True, origin="outside"))
+        for pid, g in getattr(self.counters, "host_procs", {}).get(luid, {}).items():
+            snap.procs.append(ProcRow(pid, "(unresolved host PID)", "external", g,
+                                      ProcDetail(pid, "(unresolved host PID)"), host=True, origin="nvml"))
         if self.host is not None:  # current inferred sizes drive both scan priority and the LLM breakdown
             self._add_host_rows(snap)
-        if any(row.gpu.engine_reason for row in snap.procs):
+        if any(row.gpu.engine_reason == ENGINE_UNAVAILABLE_REASON for row in snap.procs):
             snap.counter_status = " ".join(filter(None, (
                 snap.counter_status,
                 "Windows GPU engine utilization counters outside 0-1000% are unavailable for affected processes "
@@ -474,8 +518,11 @@ class Collector:
                 snap.counter_status, "Windows per-process counters exceed device capacity and may overlap; "
                                      "attributed total is unknown. Use the adapter reading as the device total.")))
         local_rows = [r for r in snap.procs if not r.host]
-        deep_pids = {r.pid for r in local_rows[: self.DEEP_TOP_N]} | {
-            r.pid for r in local_rows if r.gpu.gpu_pct >= 2}
+        if self.scan_budget is None:
+            deep_pids = {r.pid for r in local_rows}
+        else:
+            deep_pids = {r.pid for r in local_rows[: self.DEEP_TOP_N]} | {
+                r.pid for r in local_rows if r.gpu.gpu_pct >= 2}
         deadline = None if self.scan_budget is None else time.perf_counter() + self.scan_budget
         ollama_runners = []
         for row in local_rows:  # largest VRAM first, so the budget goes to what matters
@@ -522,10 +569,12 @@ class Collector:
             host = self.prober.get(parent_ports, kind=kind, origin=parent_origin)
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
-            held = (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else (row.gpu.shared or 0))
+            unproven_owner = snap.backend == "nvml" and bool(row.gpu.inferred_by)
+            held = 0 if unproven_owner else (
+                (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else (row.gpu.shared or 0)))
             row.llm = build_view(row.detail, held, row.gpu.shared if snap.shared_is_spill else 0,
                                  own or host, log, host=host if own else None,
-                                 attributed=row.gpu.shown_vram is not None,
+                                 attributed=row.gpu.shown_vram is not None and not unproven_owner,
                                  server_source="process" if own else "parent" if host else None)
             locked = None if own else self.prober.locked_port(ports, key, kind=kind, origin=own_origin)
             if locked:
@@ -568,7 +617,9 @@ class Collector:
         vm_workers = [pid for pid in procs if hs.names.get(pid, "").lower() == "vmwp"]
         host_rows: list[ProcRow] = []
         for pid, g in procs.items():
-            if not _is_live(g):
+            # Keep large commitments visible even when the residency inputs needed for Paged are missing.
+            committed_only_activity = "committed" in g.available and g.committed >= 16 * MiB and not g.paged_available
+            if not _is_live(g) and not committed_only_activity:
                 continue
             raw = hs.names.get(pid, "?")
             if raw.lower() == "vmwp":
