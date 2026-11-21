@@ -162,7 +162,8 @@ def main() -> None:
         from .dxgi import VENDOR_AMD
         from .tcc import TccAdapter, tcc_discovery_status
 
-        adapters = ordered_adapters(enumerate_adapters())
+        found = enumerate_adapters()
+        adapters = ordered_adapters(found)
         for i, adapter in enumerate(adapters):
             if isinstance(adapter, TccAdapter):  # its LUID is made up from the PCI identity, so show the address
                 bus, device, function = adapter.pci_address
@@ -173,6 +174,10 @@ def main() -> None:
                 print(f"{i}: {adapter.name} ({adapter.vendor}, LUID 0x{adapter.luid & 0xffffffffffffffff:016x})")
             if adapter.identity_status:
                 print(f"   {adapter.identity_status}")
+        if hidden := sorted({a.name for a in found if a.software}):
+            print(f"Hidden (software rendering, no GPU to monitor): {', '.join(hidden)}", file=sys.stderr)
+            if not adapters:
+                print("No hardware GPU found; check that its display driver is installed and enabled.", file=sys.stderr)
         status = tcc_discovery_status()
         if status:
             print(f"TCC/MCDM discovery: {status}", file=sys.stderr)

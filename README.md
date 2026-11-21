@@ -675,7 +675,10 @@ two devices by memory usage; Linux processes are listed once with GPU `?`, becau
 does not identify their GPU. `--gpu N` retains the existing single-device host matching.
 
 `--list-gpus` lists selectable non-software DXGI adapters on Windows (including root-enumerated
-display adapters), or hardware adapters on other platforms, with their vendor and adapter key. `--gpu N` selects
+display adapters), or hardware adapters on other platforms, with their vendor and adapter key.
+"Microsoft Basic Render Driver" (WARP, Windows' CPU rasterizer) is hidden even when Windows lists it
+without the software flag in place of a display adapter whose driver is missing or disabled; it has no
+GPU memory or engines to show. `--list-gpus` names hidden adapters on stderr. `--gpu N` selects
 one of these adapters: NVIDIA adapters are listed first, followed by other vendors, with each
 group ordered by dedicated memory. An out-of-range
 index is rejected rather than silently selecting another device. Compute-only devices such as an
