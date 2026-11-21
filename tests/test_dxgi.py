@@ -237,6 +237,49 @@ class AdapterIdentityTests(unittest.TestCase):
             main()
         self.assertIn(f"2: {STARDESK} (ROOT display adapter, LUID 0x0000000000020452)", output.getvalue())
 
+    def test_basic_render_stand_ins_are_hidden_with_a_reason(self):
+        # The reporter's machine (#133): two RTX 3090s plus two Basic Render adapters without the software flag.
+        rows = [("NVIDIA GeForce RTX 3090", 0x10de, 0x2204, 0, 24 << 30),
+                (dxgi.BASIC_RENDER, 0x1414, 0x8c, 0, 0),
+                (dxgi.BASIC_RENDER, 0x1414, 0x8c, 2, 0),  # the always-present WARP adapter
+                (dxgi.BASIC_RENDER, 0x1234, 0x1, 0, 0),
+                ("Microsoft Hyper-V Video", 0x1414, 0x5353, 0, 0)]
+
+        def enum(factory, index, out):
+            if index == len(rows):
+                return 0x887a0002
+            out._obj.value = index + 10
+            return 0
+
+        def description(adapter, desc):
+            name, vendor, device, flags, vram = rows[adapter.value - 10]
+            desc._obj.Description, desc._obj.VendorId, desc._obj.DeviceId = name, vendor, device
+            desc._obj.Flags, desc._obj.DedicatedVideoMemory = flags, vram
+            desc._obj.AdapterLuid.LowPart = adapter.value
+            return 0
+
+        api = Mock()
+        api.CreateDXGIFactory1.return_value = 0
+        with patch.object(dxgi.ctypes, "WinDLL", return_value=api, create=True), \
+                patch.object(dxgi, "_vcall", side_effect=lambda obj, index, *types: {
+                    12: enum, 10: description, 2: lambda obj: None}[index]), \
+                patch.object(dxgi, "adapter_identity", return_value=("PCI\\x", "")), \
+                patch.object(dxgi, "adapter_pci_address", return_value=None):
+            found = dxgi.enumerate_adapters(strict=True)
+        self.assertEqual([a.software for a in found], [False, True, True, True, False])
+        self.assertEqual([a.name for a in ordered_adapters(found)],
+                         ["NVIDIA GeForce RTX 3090", "Microsoft Hyper-V Video"])
+        for listed, hint in ((found, False), ([a for a in found if a.software], True)):
+            with self.subTest(hint=hint):
+                out, err = io.StringIO(), io.StringIO()
+                with patch("sys.argv", ["gputaskman", "--list-gpus"]), patch("gputaskman.cli._check_platform"), \
+                        patch("gputaskman.collector.enumerate_adapters", return_value=listed), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    main()
+                self.assertNotIn(dxgi.BASIC_RENDER, out.getvalue())
+                self.assertIn(f"Hidden (software rendering, no GPU to monitor): {dxgi.BASIC_RENDER}", err.getvalue())
+                self.assertEqual("No hardware GPU found" in err.getvalue(), hint)
+
     def test_unmatched_report_stays_unknown_in_json_text_and_tui(self):
         c = Collector.__new__(Collector)
         c.adapter = self.identify(self.adapter())
