@@ -870,7 +870,7 @@ def _pid(proc: dict) -> str:
     label = "?" if pid is None else str(pid)
     if host == "windows":
         return f"W:{label}"
-    if host == "outside":
+    if host in ("outside", "nvml"):
         return f"H:{label}"
     return label
 
@@ -894,7 +894,7 @@ def _shared(snapshot: dict, proc: dict) -> str:
         return gb(number)
     backend = snapshot.get("backend")
     host = proc.get("host")
-    applies = backend == "wddm" or host == "windows" or (backend == "drm" and host not in ("windows", "outside"))
+    applies = backend == "wddm" or host == "windows" or (backend == "drm" and host not in ("windows", "outside", "nvml"))
     return "n/a" if applies else ""
 
 
@@ -909,6 +909,14 @@ def _pct(value) -> str:
 
 def _note(proc: dict) -> str:
     parts = []
+    fallback = []
+    for key, label in (("wddm_dedicated_usage_bytes", "Dedicated Usage"),
+                       ("wddm_shared_usage_bytes", "Shared Usage")):
+        value = _number(proc.get(key))
+        if value is not None:
+            fallback.append(f"{label} {gb(value)}")
+    if fallback:
+        parts.append("Windows fallback " + ", ".join(fallback) + " (may overlap; not attributed)")
     if _shown_vram(proc) is not None and (proc.get("vram_attributed") is False
                                           or vram_mark(proc.get("vram_inferred_by"))):
         parts.append("inferred")

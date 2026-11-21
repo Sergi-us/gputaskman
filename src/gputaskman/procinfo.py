@@ -346,7 +346,8 @@ def _models_from_path_args(d: ProcDetail) -> list[MappedModel]:
     return found
 
 
-def make_model(path: str, size: int, resident: int, gg: bool, source: str, store: str | None = None) -> MappedModel:
+def make_model(path: str, size: int, resident: int | None, gg: bool, source: str,
+               store: str | None = None) -> MappedModel:
     g = read_gguf(path) if gg else None
     kind = g.kind if g is not None and not g.error else ""
     store = store if store is not None else store_name(path)
@@ -437,9 +438,9 @@ def installed_models(exe: str, now: float | None = None) -> list[MappedModel]:
     for folder, group in by_dir.items():
         if len(group) == 1:  # one file: name it by the file
             path, size = group[0]
-            found.append(make_model(path, size, 0, path.lower().endswith(".gguf") and is_gguf(path), "installed"))
+            found.append(make_model(path, size, None, path.lower().endswith(".gguf") and is_gguf(path), "installed"))
         else:  # several files (encoder + decoder, shards): name it by the folder
-            found.append(make_model(folder, sum(s for _, s in group), 0, False, "installed", store_name(group[0][0])))
+            found.append(make_model(folder, sum(s for _, s in group), None, False, "installed", store_name(group[0][0])))
     found = sorted(found, key=lambda m: -m.size)[:6]
     _installed[key] = (now, found)
     return found
@@ -575,7 +576,7 @@ class ProcInspector:
             if key in models:
                 models[key].add_source("cmdline")
             else:
-                models[key] = make_model(path, os.path.getsize(path), 0, is_gguf(path), "cmdline")
+                models[key] = make_model(path, os.path.getsize(path), None, is_gguf(path), "cmdline")
         for model in _models_from_path_args(d):
             key = file_key(model.path)
             if key in models:

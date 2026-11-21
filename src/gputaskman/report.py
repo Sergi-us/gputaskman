@@ -7,13 +7,13 @@ import json
 import os
 
 from .collector import ProcRow, Snapshot
-from .llm import gb, server_gauge_text, vllm_rate_text
+from .llm import LOG_HISTORY_LABEL, gb, log_buffer_text, server_gauge_text, vllm_rate_text
 from .nvml import format_metric
 from .pdh import ProcGpu
 from .tcc import TccAdapter
 
 
-WSL_HOST_NOTE = ("WSL + Windows host counters: 'WSL VM' is the exact total of Linux GPU memory (all distros). "
+WSL_HOST_NOTE = ("WSL + Windows host counters: 'WSL VM' VRAM, when available, is the exact total across all Linux distros. "
                  "Linux rows get their size by matching the VM's GPU contexts (* matched, ? guess). "
                  "W: rows are Windows processes.")
 
@@ -55,19 +55,35 @@ def vram_label(g: ProcGpu) -> str:
     return "n/a" if g.shown_vram is None else gb(g.shown_vram) + vram_mark(g.inferred_by)
 
 
+def wddm_fallback_note(g: ProcGpu) -> str:
+    parts = []
+    if g.wddm_dedicated_usage is not None:
+        parts.append(f"Dedicated Usage {gb(g.wddm_dedicated_usage)}")
+    if g.wddm_shared_usage is not None:
+        parts.append(f"Shared Usage {gb(g.wddm_shared_usage)}")
+    if not parts:
+        return ""
+    return ("Windows fallback " + ", ".join(parts) + ": may include surfaces shared across processes; "
+            "not attributed bytes and not added to totals or used for Paged.")
+
+
 INFERRED_NOTE = ("* matched: the size is exact (Windows' counter for a WSL VM GPU context, or NVML for a host PID "
                  "seen from a container); which local process owns it is inferred, and only one explanation fits "
                  "(or every one that fits gives the same size).")
 ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer processes are paired with newer "
               "GPU contexts / PIDs and outside ones are assumed oldest. Cached foreign-size hints only rank extra "
-              "candidates; they never prove ownership. Becomes * with evidence, such as a process starting while "
-              "gputaskman runs.")
+              "candidates; they never prove ownership. WSL may promote to * when its context tracker uniquely "
+              "identifies an owner or every viable context gives the same bytes. Container process/NVML start "
+              "correlation only keeps a pair stable; it does not prove ownership. Container guesses are not added "
+              "to measured totals; measured VRAM and engines remain on H: host-PID rows with unresolved local ownership.")
 
 
 DRM_NOTES = {
     "legacy": ("VRAM n/a: this driver's fdinfo has missing or unparseable drm-shared-* stats (older amdgpu kernels, "
                "Intel integrated GPUs, xe), so resident memory may include buffers imported from other processes "
                "and would be counted once per importer."),
+    "client_id": ("VRAM and GPU% n/a: this driver's fdinfo has no usable drm-client-id, so duplicate descriptors "
+                  "or another process holding the same DRM client can't be ruled out."),
     "shared_client": ("VRAM and GPU% n/a: this process holds a DRM client other processes hold too (fd passing, "
                       "fork). fdinfo counts the client once and doesn't say which of them uses it."),
     "shared_buffers": ("VRAM n/a: this process's DRM client shares buffers with other clients (dma-buf, e.g. "
@@ -133,7 +149,7 @@ def to_dict(s: Snapshot) -> dict:
         item = {
             "pid": p.pid, "host": p.origin if p.host else None, "name": p.name, "kind": p.kind, "runtimes": p.detail.runtimes,
             "started_at": round(p.detail.create_time, 3) or None,  # unknown (protected process, WSL host row) is null
-            "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
+            "vram_attributed": p.gpu.attributed and "dedicated" in p.gpu.available, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
             "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed and "dedicated" in p.gpu.available else None,
             "vram_resident_bytes": (int(p.gpu.resident_vram) if s.backend == "drm" and not p.host
@@ -142,6 +158,16 @@ def to_dict(s: Snapshot) -> dict:
                                    and p.gpu.resident_gtt is not None else None),
             "vram_unattributed_reason": p.gpu.drm_reason or None if s.backend == "drm" and not p.host else None,
             "shared_bytes": int(p.gpu.shared) if has_shared_counters(s, p) else None,
+            "wddm_dedicated_usage_bytes": (int(p.gpu.wddm_dedicated_usage)
+                                           if p.gpu.wddm_dedicated_usage is not None else None),
+            "wddm_shared_usage_bytes": (int(p.gpu.wddm_shared_usage)
+                                        if p.gpu.wddm_shared_usage is not None else None),
+            "vram_counter_source": ("Dedicated Usage" if p.gpu.wddm_dedicated_usage is not None else
+                                    "Local Usage" if wddm and not isinstance(s.adapter, TccAdapter)
+                                    and "dedicated" in p.gpu.available else None),
+            "shared_counter_source": ("Shared Usage" if p.gpu.wddm_shared_usage is not None else
+                                      "Non Local Usage" if wddm and not isinstance(s.adapter, TccAdapter)
+                                      and "shared" in p.gpu.available else None),
             "committed_bytes": int(p.gpu.committed) if wddm and "committed" in p.gpu.available else None,
             "paged_out_bytes": int(p.gpu.paged_out) if wddm and p.gpu.paged_available else None,
             "graphics_swapped_bytes": (int(p.gpu.graphics_swapped) if s.backend == "metal" and p.gpu.attributed
@@ -156,6 +182,7 @@ def to_dict(s: Snapshot) -> dict:
         if p.handy:
             item["handy"] = dataclasses.asdict(p.handy)
         if p.llm:
+            server = _server_dict(p.llm.server) if p.llm.server else None
             item["llm"] = {
                 "models": [{"path": g.path, "name": g.name, "label": p.llm.label(i), "arch": g.arch, "kind": g.kind,
                             "kind_label": p.llm.kind_label(i),
@@ -168,9 +195,13 @@ def to_dict(s: Snapshot) -> dict:
                            for i, g in enumerate(p.llm.models)],
                 "segments": [dataclasses.asdict(x) for x in p.llm.segments],
                 "kv_bytes_per_token": p.llm.kv_per_token, "n_ctx": p.llm.n_ctx, "flags": p.llm.flags,
-                "server": _server_dict(p.llm.server) if p.llm.server else None,
+                "server": server,
                 "server_source": p.llm.server_source,
-                "log_source": p.llm.log_source, "notes": p.llm.notes,
+                "log_source": p.llm.log_source,
+                "log_history": [{"device": record.device, "kind": record.kind, "bytes": record.bytes,
+                                 "timestamp": record.timestamp, "timestamp_issue": record.timestamp_issue}
+                                for record in p.llm.log],
+                "notes": p.llm.notes,
             }
         procs.append(item)
     return {
@@ -256,6 +287,12 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(INFERRED_NOTE)
     if any(p.gpu.inferred_by == "order" for p in shown):
         out.append(ORDER_NOTE)
+    if s.backend == "nvml":
+        out.extend(dict.fromkeys(p.gpu.engine_reason for p in shown if p.gpu.engine_reason))
+    for p in shown:
+        note = wddm_fallback_note(p.gpu)
+        if note:
+            out.append(f"{p.name} ({p.pid_label}): {note}")
     if s.backend == "drm":
         for note in dict.fromkeys(drm_note(p.gpu) for p in shown if not p.host):
             if note:
@@ -297,7 +334,9 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
             out.append(f"   {gb(seg.bytes):>9}  {seg.label}{'' if seg.exact else ''}")
         if p.llm.server:
             sv = p.llm.server
-            out.append(f"   server: {sv.kind} {sv.url} ctx={sv.n_ctx} slots={sv.slots_busy}/{sv.slots_total}"
+            busy = "n/a" if sv.slots_busy is None else str(sv.slots_busy)
+            total_slots = "n/a" if sv.slots_total is None else str(sv.slots_total)
+            out.append(f"   server: {sv.kind} {sv.url} ctx={sv.n_ctx} slots={busy}/{total_slots}"
                        + (f" gen={sv.gen_tok_s:.1f} tok/s" if sv.gen_tok_s is not None and sv.kind != "vllm" else ""))
             if p.llm.server_source == "parent":
                 out.append("   server source: parent process (API report, not worker residency)")
@@ -308,8 +347,9 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
                 out.append(f"   {gauges}")
             if rates := vllm_rate_text(sv):
                 out.append(f"   {rates}")
-        if p.llm.log_source:
-            out.append(f"   exact sizes from log: {p.llm.log_source}")
+        if p.llm.log:
+            out.append(f"   {LOG_HISTORY_LABEL}: {p.llm.log_source}")
+            out.extend(f"     {log_buffer_text(record, p.detail.create_time)}" for record in p.llm.log)
         for n in p.llm.notes:
             out.append(f"   - {n}")
     return "\n".join(out)

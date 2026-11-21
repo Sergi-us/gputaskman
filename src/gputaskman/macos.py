@@ -43,7 +43,10 @@ ALWAYS_SHOWN = {"windowserver"}
 
 def _ioreg(*args: str) -> list | None:
     try:
-        out = subprocess.run(["ioreg", "-a", "-w", "0", "-r", *args], capture_output=True, timeout=5).stdout
+        result = subprocess.run(["ioreg", "-a", "-w", "0", "-r", *args], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            return None
+        out = result.stdout
         return plistlib.loads(out) if out.strip() else []
     except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException, ValueError):
         return None
@@ -264,6 +267,7 @@ class MacCounters:
                  identity=_identity, owner=_owner) -> None:
         self.ok = True
         self.device: NvDevice | None = None
+        self.process_available = False
         self._uid = os.getuid() if uid is None else uid
         # As root footprint can read every process, so every process is measurable (not only uid 0's).
         self._root = (os.geteuid() == 0) if root is None else root
@@ -292,6 +296,7 @@ class MacCounters:
 
     def sample(self, accel: list | None = None, clients: list | None = None,
                now: float | None = None) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
+        self.hidden_unmeasured = False
         now = time.monotonic() if now is None else now  # a rate: immune to wall-clock adjustments
         accel = _ioreg("-d", "1", "-c", "IOAccelerator") if accel is None else accel
         clients = _ioreg("-l", "-c", "AGXDeviceUserClient") if clients is None else clients
@@ -305,6 +310,7 @@ class MacCounters:
                 adapters[ADAPTER_KEY].dedicated = float(dev.allocated)
             self.device = NvDevice(index=0, name=dev.model, driver_model="Metal", mem_total=physical_memory(),
                                    mem_used=dev.allocated, util_gpu=dev.utilization, source="IOKit")
+        self.process_available = clients is not None
         if clients is None:
             # A failed client query is not an empty client list: preserve the last valid rate baseline and
             # footprint targets so the next successful sample spans the full elapsed interval.
@@ -359,9 +365,13 @@ class MacCounters:
                     dirty, swapped = size
                     g.dedicated = float(dirty)  # dirty only; swapped is not resident graphics memory
                     g.graphics_swapped = None if swapped is None else float(swapped)
+                if size is None:
+                    g.available.discard("dedicated")
             else:
                 g.attributed = False  # footprint needs root for other users' processes
+                g.available.discard("dedicated")
                 if (pct is None or pct < 0.5) and self._name(pid).lower() not in ALWAYS_SHOWN:
+                    self.hidden_unmeasured = True
                     continue
             procs[ADAPTER_KEY][pid] = g
         self._prev, self._last = current, now

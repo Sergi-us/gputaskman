@@ -160,7 +160,7 @@ class AscendTests(unittest.TestCase):
         c.ascend_chip = chip
         c.ascend = Mock(process_available=False, status="process memory unavailable")
         c.ascend.read_device.return_value = DeviceTelemetry(index=0, name=chip.name, source="npu-smi")
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = ({}, {})
         c.nvml = Mock(ok=False)
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""

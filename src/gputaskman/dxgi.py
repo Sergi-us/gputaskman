@@ -232,6 +232,15 @@ def adapter_pci_address(luid: int) -> tuple[int, int, int] | None:
         return None
 
 
+BASIC_RENDER = "Microsoft Basic Render Driver"
+
+
+def _basic_render(desc: _DESC1) -> bool:
+    """WARP, Windows' CPU rasterizer: no GPU memory or engines to show. Windows also lists it, without
+    DXGI_ADAPTER_FLAG_SOFTWARE, in place of a display adapter whose driver is missing or disabled."""
+    return (desc.VendorId, desc.DeviceId) == (0x1414, 0x8C) or desc.Description == BASIC_RENDER
+
+
 def enumerate_adapters(*, strict: bool = False) -> list[Adapter]:
     try:
         dxgi = ctypes.WinDLL("dxgi")
@@ -266,7 +275,7 @@ def enumerate_adapters(*, strict: bool = False) -> list[Adapter]:
                         vendor_id=desc.VendorId,
                         dedicated_vram=desc.DedicatedVideoMemory,
                         shared_system=desc.SharedSystemMemory,
-                        software=bool(desc.Flags & 2),
+                        software=bool(desc.Flags & 2) or _basic_render(desc),
                     )
                     _identify_adapter(found)
                     if not found.root_display:

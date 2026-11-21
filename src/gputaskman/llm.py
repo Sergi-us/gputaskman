@@ -1,7 +1,7 @@
 """What's inside an LLM process's VRAM: weights vs KV cache vs compute/runtime.
 
 Evidence, best first:
-  1. llama.cpp / Ollama load logs  -> exact per-device buffer sizes
+  1. llama.cpp / Ollama load logs  -> timestamped load-time buffer history
   2. Local server endpoints        -> llama-server /props,/v1/models,/slots,/metrics; Ollama /api/ps;
                                       LM Studio /api/v1/models (falls back to /api/v0/models);
                                       Foundry Local /models/loaded (loaded IDs only)
@@ -12,6 +12,7 @@ The process's real VRAM total always comes from Windows, so the remainder is nev
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import json
 import math
@@ -62,13 +63,48 @@ def parse_flags(cmd: list[str]) -> dict:
     return out
 
 
-# ---------------------------------------------------------------- logs (exact numbers)
+# ---------------------------------------------------------------- runtime log history
 
 _LLAMA_BUF = re.compile(r"(\S+)\s+(model|KV|compute|output|RS)\s+buffer size\s*=\s*([\d.]+)\s*MiB")
 _OLLAMA_BUF = re.compile(r'msg="(model weights|kv cache|compute graph)"\s+device=(\S+)\s+size="([\d.]+)\s*(GiB|MiB|KiB|B)"')
+_LOG_TIMESTAMP = re.compile(
+    r'^\s*(?:time="?|\[)?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?'
+    r'(?:Z|[+-]\d{2}:?\d{2})?)(?=[\s"\]]|$)'
+)
 _UNIT = {"GiB": 1 << 30, "MiB": 1 << 20, "KiB": 1 << 10, "B": 1}
 _KIND = {"model": "weights", "model weights": "weights", "KV": "kv", "kv cache": "kv", "RS": "kv",
          "compute": "compute", "compute graph": "compute", "output": "compute"}
+
+
+@dataclass
+class LoggedBuffer:
+    device: str
+    kind: str
+    bytes: int
+    timestamp: str | None
+    timestamp_epoch: float | None
+    timestamp_issue: str | None
+
+
+def _log_timestamp(line: str) -> tuple[str | None, float | None, str | None]:
+    match = _LOG_TIMESTAMP.search(line)
+    if not match:
+        return None, None, "missing"
+    value = match[1]
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value, None, "unparseable"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return value, None, "timezone-unknown"
+    try:
+        return value, _datetime_epoch(parsed), None
+    except (OSError, OverflowError, ValueError):
+        return value, None, "unrepresentable"
+
+
+def _datetime_epoch(value: datetime.datetime) -> float:
+    return value.timestamp()
 
 
 def is_gpu_device(dev: str) -> bool:
@@ -76,27 +112,30 @@ def is_gpu_device(dev: str) -> bool:
     return not (d.startswith("CPU") or "HOST" in d or d.startswith("MMAP"))
 
 
-def parse_load_log(path: str, not_before: float = 0.0) -> dict[str, dict[str, int]] | None:
-    """Most recent model-load block in a llama.cpp/Ollama log -> {device: {kind: bytes}}."""
+def parse_load_log(path: str) -> list[LoggedBuffer]:
+    """Read recent buffer records, not a proven load block or a set of simultaneous allocations."""
+    limit = 512 << 10
     try:
-        if os.path.getmtime(path) < not_before:
-            return None
         with open(path, "rb") as f:
-            f.seek(0, 2)
-            f.seek(max(f.tell() - (512 << 10), 0))
-            lines = f.read().decode("utf-8", "replace").splitlines()
+            offset = max(f.seek(0, 2) - limit, 0)
+            f.seek(offset)
+            tail = f.read(limit)
     except OSError:
-        return None
+        return []
+    if offset:
+        # A clipped line could lose its timestamp or contain only part of a buffer record.
+        tail = tail.partition(b"\n")[2]
+    lines = tail.decode("utf-8", "replace").splitlines()
     start = None
-    for i in range(len(lines) - 1, -1, -1):  # last load starts at its first weights line
+    for i in range(len(lines) - 1, -1, -1):  # Bound displayed history to the most recent weights run onward.
         if "model buffer size" in lines[i] or 'msg="model weights"' in lines[i]:
             start = i
             while start > 0 and ("model buffer size" in lines[start - 1] or 'msg="model weights"' in lines[start - 1]):
                 start -= 1
             break
     if start is None:
-        return None
-    out: dict[str, dict[str, int]] = {}
+        return []
+    out = []
     for line in lines[start:]:
         m = _LLAMA_BUF.search(line)
         if m:
@@ -106,9 +145,8 @@ def parse_load_log(path: str, not_before: float = 0.0) -> dict[str, dict[str, in
             if not m:
                 continue
             dev, kind, n = m[2], _KIND[m[1]], int(float(m[3]) * _UNIT[m[4]])
-        out.setdefault(dev, {}).setdefault(kind, 0)
-        out[dev][kind] += n
-    return out or None
+        out.append(LoggedBuffer(dev, kind, n, *_log_timestamp(line[:m.start()])))
+    return out
 
 
 def ollama_log_path() -> str:
@@ -208,6 +246,8 @@ class ServerInfo:
     kv_cache_usage: float | None = None  # fraction 0-1 of KV-cache pool, not of GPU memory
     # vLLM only: last token-counter reading, the baseline for the next probe's rates. Kept out of JSON.
     token_sample: TokenSample | None = field(default=None, repr=False, compare=False, metadata={"json": False})
+    # internal guard against inferring a singleton from partial API data. Kept out of JSON.
+    models_complete: bool = field(default=True, metadata={"json": False})
 
 
 def _metric(text: str, name: str) -> float | None:
@@ -357,43 +397,104 @@ def _model_entry(name, type_=None, quant=None, ctx=None, size=None, size_vram=No
     return {"name": name, "type": type_, "quant": quant, "ctx": ctx, "size": size, "size_vram": size_vram, "path": path}
 
 
+def _runtime_text(value) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _runtime_int(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 _MODALITY = {"text": "llm", "decisions": "decision", "embeddings": "embedding", "embedding": "embedding"}
 
 
 def llama_server_models(v1: dict, model_path: str | None) -> list[dict]:
     out = []
-    for m in v1.get("data") or []:
-        outs = (m.get("architecture") or {}).get("output_modalities") or []
-        meta = m.get("meta") or {}
-        out.append(_model_entry(os.path.basename(m.get("id") or model_path or "?"),
-                                next((_MODALITY.get(o, o) for o in outs), None),
-                                meta.get("ftype"), meta.get("n_ctx"), meta.get("size"), None, model_path))
+    entries = v1.get("data")
+    for m in entries if isinstance(entries, list) else []:
+        if not isinstance(m, dict):
+            continue
+        architecture = m.get("architecture")
+        outs = architecture.get("output_modalities") if isinstance(architecture, dict) else None
+        outs = [o for o in outs if isinstance(o, str)] if isinstance(outs, list) else []
+        meta = m.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        model_id = _runtime_text(m.get("id"))
+        path = _runtime_text(model_path)
+        name = os.path.basename(model_id if model_id else path or "?")
+        out.append(_model_entry(name, next((_MODALITY.get(o, o) for o in outs), None),
+                                _runtime_text(meta.get("ftype")), _runtime_int(meta.get("n_ctx")),
+                                _runtime_int(meta.get("size")), None, path))
     return out
 
 
 def ollama_models(ps: dict) -> list[dict]:
-    return [_model_entry(m.get("name"), "llm", (m.get("details") or {}).get("quantization_level"),
-                         m.get("context_length"), m.get("size"), m.get("size_vram"))
-            for m in ps.get("models") or []]
+    entries = ps.get("models")
+    out = []
+    for m in entries if isinstance(entries, list) else []:
+        if not isinstance(m, dict):
+            continue
+        details = m.get("details")
+        details = details if isinstance(details, dict) else {}
+        out.append(_model_entry(_runtime_text(m.get("name")), "llm",
+                                _runtime_text(details.get("quantization_level")),
+                                _runtime_int(m.get("context_length")), _runtime_int(m.get("size")),
+                                _runtime_int(m.get("size_vram"))))
+    return out
 
 
-def lmstudio_models(v1: dict | None, v0: dict | None) -> list[dict] | None:
+def lmstudio_models(v1: dict | None, v0: dict | None) -> tuple[list[dict], bool] | None:
     """Loaded models from LM Studio's /api/v1/models (preferred) or /api/v0/models."""
     if isinstance(v1, dict) and isinstance(v1.get("models"), list):
         out = []
+        complete = True
         for m in v1["models"]:
-            for inst in m.get("loaded_instances") or []:
-                q = m.get("quantization") or {}
-                t = m.get("type")
-                if t == "decision" and m.get("decision_type"):
-                    t = f"decision ({m['decision_type']})"
-                out.append(_model_entry(inst.get("id") or m.get("key"), t, q.get("name"),
-                                        (inst.get("config") or {}).get("context_length"), m.get("size_bytes")))
-        return out
+            if not isinstance(m, dict):
+                complete = False
+                continue
+            instances = m.get("loaded_instances")
+            if not isinstance(instances, list):
+                complete = False
+                continue
+            for inst in instances:
+                if not isinstance(inst, dict):
+                    complete = False
+                    continue
+                q = m.get("quantization")
+                q = q if isinstance(q, dict) else {}
+                t = _runtime_text(m.get("type"))
+                decision_type = _runtime_text(m.get("decision_type"))
+                if t == "decision" and isinstance(decision_type, str) and decision_type:
+                    t = f"decision ({decision_type})"
+                config = inst.get("config")
+                config = config if isinstance(config, dict) else {}
+                name = _runtime_text(inst.get("id"))
+                if not name or not name.strip():
+                    name = _runtime_text(m.get("key"))
+                if not name or not name.strip():
+                    complete = False
+                    continue
+                out.append(_model_entry(name, t, _runtime_text(q.get("name")),
+                                        _runtime_int(config.get("context_length")), _runtime_int(m.get("size_bytes"))))
+        return out, complete
     if isinstance(v0, dict) and isinstance(v0.get("data"), list):
-        return [_model_entry(m.get("id"), m.get("type"), m.get("quantization"),
-                             m.get("loaded_context_length") or m.get("max_context_length"))
-                for m in v0["data"] if m.get("state") == "loaded"]
+        out = []
+        complete = True
+        for m in v0["data"]:
+            if not isinstance(m, dict) or not isinstance(m.get("state"), str):
+                complete = False
+                continue
+            if m["state"] != "loaded":
+                continue
+            name = _runtime_text(m.get("id"))
+            if not name or not name.strip():
+                complete = False
+                continue
+            ctx = _runtime_int(m.get("loaded_context_length"))
+            if ctx is None:
+                ctx = _runtime_int(m.get("max_context_length"))
+            out.append(_model_entry(name, _runtime_text(m.get("type")), _runtime_text(m.get("quantization")), ctx))
+        return out, complete
     return None
 
 
@@ -452,19 +553,23 @@ def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = No
     if props is UNAUTHORIZED:
         return UNAUTHORIZED
     if isinstance(props, dict) and ("default_generation_settings" in props or "model_path" in props):
-        s = ServerInfo("llama-server", base, model_path=props.get("model_path"))
-        dgs = props.get("default_generation_settings") or {}
-        s.n_ctx = dgs.get("n_ctx") or props.get("n_ctx")
-        s.slots_total = props.get("total_slots")
+        s = ServerInfo("llama-server", base, model_path=_runtime_text(props.get("model_path")))
+        dgs = props.get("default_generation_settings")
+        dgs = dgs if isinstance(dgs, dict) else {}
+        s.n_ctx = _runtime_int(dgs.get("n_ctx"))
+        if s.n_ctx is None:
+            s.n_ctx = _runtime_int(props.get("n_ctx"))
+        s.slots_total = _runtime_int(props.get("total_slots"))
         if prev and prev.kind == "llama-server" and prev.model_path == s.model_path:
             s.models = prev.models  # identity only changes when the model does
         else:
             v1 = _get(base + "/v1/models", key=key)
             s.models = llama_server_models(v1, s.model_path) if isinstance(v1, dict) else []
         slots = _get(base + "/slots", key=key)
-        if isinstance(slots, list):
+        if isinstance(slots, list) and all(
+                isinstance(slot, dict) and isinstance(slot.get("is_processing"), bool) for slot in slots):
             s.slots_total = len(slots)
-            s.slots_busy = sum(1 for x in slots if x.get("is_processing"))
+            s.slots_busy = sum(1 for slot in slots if slot["is_processing"])
             s.requests_running = s.slots_busy
         metrics = _get(base + "/metrics", key=key)
         if isinstance(metrics, str):
@@ -488,7 +593,8 @@ def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = No
     if loaded is None:
         loaded = lmstudio_models(None, _get(base + "/api/v0/models"))
     if loaded is not None:
-        return ServerInfo("lmstudio", base, models=loaded)
+        models, complete = loaded
+        return ServerInfo("lmstudio", base, models=models, models_complete=complete)
     return None
 
 
@@ -559,7 +665,7 @@ class LlmView:
     host: ServerInfo | None = None  # managing front-end (Ollama / LM Studio) when the runner has its own server
     server_source: str | None = None  # process | parent; an API report, not proof of worker residency
     log_source: str | None = None
-    log: dict | None = None
+    log: list[LoggedBuffer] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     kv_per_token: int | None = None
@@ -588,6 +694,26 @@ def gb(n: float) -> str:
     return f"{n / MiB:.0f} MB"
 
 
+LOG_HISTORY_LABEL = "Load-log history (runtime-reported; not current residency or allocation)"
+
+
+def log_buffer_text(record: LoggedBuffer, process_start: float) -> str:
+    when = record.timestamp or "timestamp unavailable"
+    if record.timestamp_issue == "timezone-unknown":
+        when += " (has no timezone)"
+    elif record.timestamp_issue == "unrepresentable":
+        when += " (cannot be converted on this platform)"
+    elif record.timestamp_issue == "unparseable":
+        when += " (unparseable timestamp)"
+    elif record.timestamp_epoch is not None:
+        if process_start <= 0:
+            when += " (process start time unknown)"
+        elif record.timestamp_epoch < process_start - 5:
+            when += " (predates this process)"
+    size = f"{record.bytes / MiB:.2f}".rstrip("0").rstrip(".") + " MiB" if record.bytes >= MiB else f"{record.bytes} B"
+    return f"{record.device} {record.kind}: {size} at {when}"
+
+
 _SIDE_KINDS = ("vision projector", "LoRA adapter")
 
 
@@ -600,7 +726,7 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
         if hit:
             hit.add_source("api")
         elif os.path.isfile(server.model_path):  # loaded without mmap or via the router: API-only evidence
-            files.insert(0, make_model(server.model_path, os.path.getsize(server.model_path), 0,
+            files.insert(0, make_model(server.model_path, os.path.getsize(server.model_path), None,
                                        is_gguf(server.model_path), "api"))
     for front in (s for s in (server, host) if s and s.kind == "ollama"):
         for f in files:
@@ -613,7 +739,8 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
                     matched.append(om)
     lms = host if host and host.kind == "lmstudio" else (server if server and server.kind == "lmstudio" else None)
     primary = [f for f in files if f.has_model_evidence and f.kind not in _SIDE_KINDS]
-    if lms and len(lms.models) == 1 and len(primary) == 1:  # LM Studio keys don't map to paths; only pair 1:1
+    if lms and lms.models_complete and len(lms.models) == 1 and len(primary) == 1:
+        # LM Studio keys don't map to paths; only pair a complete one-to-one listing.
         primary[0].add_source("api")
         matched.append(lms.models[0])
     return matched
@@ -664,7 +791,7 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
 
     log_path = log_path or v.flags.get("log_file")
     if log_path:
-        v.log = parse_load_log(log_path, not_before=d.create_time - 5)
+        v.log = parse_load_log(log_path)
         v.log_source = log_path if v.log else None
 
     main = next((g for g in v.models if g.kind == "LLM" and g.n_layers), None)  # only causal LLMs grow a KV cache
@@ -684,53 +811,39 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
     no_kv = bool(primaries) and all(not g.causal for g in primaries)
 
     total = int(vram) if attributed else None  # None: the OS can't say how much VRAM this process holds
-    if v.log:
-        gpu = {dev: kinds for dev, kinds in v.log.items() if is_gpu_device(dev)}
-        acc = 0
-        for kind, label in (("weights", "weights"), ("kv", "KV cache"), ("compute", "compute buffers")):
-            n = sum(k.get(kind, 0) for k in gpu.values())
-            if n:
-                devs = ",".join(sorted(dev for dev, k in gpu.items() if k.get(kind)))
-                v.segments.append(Segment(f"{label} ({devs})", n, kind, exact=True))
-                acc += n
-        cpu_w = sum(k.get("weights", 0) for dev, k in v.log.items() if not is_gpu_device(dev))
-        if cpu_w and main and cpu_w > main.token_embd_bytes * 1.5:
-            v.notes.append(f"{gb(cpu_w)} of weights are on the CPU side (partial offload or CPU-mapped).")
-        if total is not None and total > acc:
-            v.segments.append(Segment("runtime and other overhead", total - acc, "runtime"))
-    else:
-        ngl = v.flags.get("ngl") if len(v.models) == 1 else None
-        weights = sum(g.gpu_weight_bytes(ngl) for g in v.models if g.kind != "LoRA adapter")
-        weights += sum(g.tensor_bytes for g in v.models if g.kind == "LoRA adapter")
-        if total is not None and weights > total * 1.03 and total > 0:
-            v.notes.append(f"Weights need ~{gb(weights)} but the process holds {gb(total)} of VRAM: "
-                           "partial offload, paging, or placement on another GPU may explain the gap.")
-            weights = total
-        if weights:
-            label = "weights" if len(v.models) == 1 else f"weights ({len(v.models)} files)"
-            v.segments.append(Segment(label, weights, "weights"))
-        kv = v.kv_per_token * v.n_ctx if (v.kv_per_token and v.n_ctx) else 0
-        rest = total - weights if total is not None else None
-        if rest is None:
-            if kv:
-                v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.", kv, "kv"))
-            v.notes.append("This process's VRAM total is unknown (WSL charges it to the VM on the Windows host, "
-                           "or the driver hides per-process memory); segments are estimates from the model file and launch flags.")
-        elif kv and kv <= rest:
-            swa = main.sliding_window if main else None
-            v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.{' max' if swa else ''}", kv, "kv"))
-            if swa:
-                v.notes.append(f"Sliding-window attention ({swa} tokens): most layers keep a short KV window, "
-                               "so the real KV cache is smaller than this estimate.")
-            rest -= kv
-            if rest > 0:
-                v.segments.append(Segment("compute buffers + runtime", rest, "runtime"))
-        elif rest > 0 and no_kv:
+    ngl = v.flags.get("ngl") if len(v.models) == 1 else None
+    weights = sum(g.gpu_weight_bytes(ngl) for g in v.models if g.kind != "LoRA adapter")
+    weights += sum(g.tensor_bytes for g in v.models if g.kind == "LoRA adapter")
+    if total is not None and weights > total * 1.03 and total > 0:
+        v.notes.append(f"Weights need ~{gb(weights)} but the process holds {gb(total)} of VRAM: "
+                       "partial offload, paging, or placement on another GPU may explain the gap.")
+        weights = total
+    if weights:
+        label = "weights" if len(v.models) == 1 else f"weights ({len(v.models)} files)"
+        v.segments.append(Segment(label, weights, "weights"))
+    kv = v.kv_per_token * v.n_ctx if (v.kv_per_token and v.n_ctx) else 0
+    rest = total - weights if total is not None else None
+    if rest is None:
+        if kv:
+            v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.", kv, "kv"))
+        v.notes.append("This process's VRAM total is unknown (WSL charges it to the VM on the Windows host, "
+                       "container ownership is inferred, or the driver hides per-process memory); "
+                       "segments are estimates from the model file and launch flags.")
+    elif kv and kv <= rest:
+        swa = main.sliding_window if main else None
+        v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.{' max' if swa else ''}", kv, "kv"))
+        if swa:
+            v.notes.append(f"Sliding-window attention ({swa} tokens): most layers keep a short KV window, "
+                           "so the real KV cache is smaller than this estimate.")
+        rest -= kv
+        if rest > 0:
             v.segments.append(Segment("compute buffers + runtime", rest, "runtime"))
-        elif rest > 0:
-            v.segments.append(Segment("KV cache + compute + runtime", rest, "unknown"))
+    elif rest > 0 and no_kv:
+        v.segments.append(Segment("compute buffers + runtime", rest, "runtime"))
+    elif rest > 0:
+        v.segments.append(Segment("KV cache + compute + runtime", rest, "unknown"))
 
-    if not v.models and not v.log and total:
+    if not v.models and total:
         v.notes.append("No GGUF mapped. Model may be loaded with --no-mmap or via another format.")
     if no_kv:
         kinds = ", ".join(sorted({f"{g.decision_type} {g.kind}" if g.decision_type else g.kind for g in primaries}))
@@ -746,10 +859,12 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
     for front in (s for s in (server, host) if s and s.kind == "ollama"):
         mine = [om for om in front.models if om in matched]
         for om in mine or front.models:  # unmatched: show everything Ollama has loaded
-            if om.get("size"):
-                pct = 100 * (om.get("size_vram") or 0) / om["size"]
+            size = _runtime_int(om.get("size"))
+            if size:
+                size_vram = _runtime_int(om.get("size_vram"))
+                pct = f"{100 * size_vram / size:.0f}%" if size_vram is not None else "n/a"
                 v.notes.append(f"Ollama{'' if mine else ' (not matched to this runner)'}: {om['name']} "
-                               f"{gb(om['size'])} total, {pct:.0f}% on GPU, ctx {om.get('ctx') or '?'}.")
+                               f"{gb(size)} total, {pct} on GPU, ctx {om.get('ctx') or '?'}.")
     if host and host.kind == "lmstudio":
         for m in host.models[:4]:
             v.notes.append(f"LM Studio: {m['name']} {m.get('type') or ''} {m.get('quant') or ''} "

@@ -336,12 +336,27 @@ class DisplayTests(unittest.TestCase):
                       vram_inferred_by="consistent")
         self.assertTrue(process_rows(snap(processes=[agreed]))[0][0][3].endswith("*"))
 
+    def test_windows_fallback_values_remain_labeled_in_replay(self):
+        row = proc(vram=None, vram_attributed=False, shared_bytes=None,
+                   wddm_dedicated_usage_bytes=512 * (1 << 20), wddm_shared_usage_bytes=0)
+        cells = process_rows(snap(processes=[row]))[0][0]
+        self.assertEqual(cells[3:5], ("n/a", "n/a"))
+        self.assertIn("Dedicated Usage 512 MB", cells[7])
+        self.assertIn("Shared Usage 0 MB", cells[7])
+        self.assertIn("may overlap; not attributed", cells[7])
+
     def test_an_attributed_row_with_an_inferred_owner_keeps_its_mark(self):
         host_pid = proc(vram=GiB, vram_attributed=True, vram_inferred_by="consistent")
         cells = process_rows(snap(processes=[host_pid]))[0][0]
         self.assertEqual(cells[3], "1.00 GB*")
         self.assertIn("inferred", cells[7])
         self.assertIn("* matched", describe(_view(), Playback(1, [1.0], timed=False), snap(processes=[host_pid])))
+
+    def test_unresolved_nvml_host_pid_keeps_its_namespace_label(self):
+        host_pid = proc(pid=9000, name="(unresolved host PID)", host="nvml", vram=3 * GiB)
+        cells = process_rows(snap(backend="nvml", processes=[host_pid]))[0][0]
+        self.assertEqual(cells[0], "H:9000")
+        self.assertEqual(cells[3], "3.00 GB")
 
     def test_malformed_inferred_by_renders_unmarked(self):
         for by in (["order"], {"a": 1}, 3, "other"):

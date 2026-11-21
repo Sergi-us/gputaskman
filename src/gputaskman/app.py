@@ -19,11 +19,11 @@ from textual.worker import get_current_worker
 
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
 from .host import HostSample, HostSampler
-from .llm import gb, redact_cmdline, server_gauge_text, vllm_rate_text
+from .llm import LOG_HISTORY_LABEL, gb, log_buffer_text, redact_cmdline, server_gauge_text, vllm_rate_text
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WDDM_DEVICE_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_shared_counters, has_wddm_counters,
-                     inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
+                     inferred_note, intel_memory_note, vram_label, vram_total_label, wddm_fallback_note, wsl_note)
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -37,8 +37,8 @@ SPARK = "▁▂▃▄▅▆▇█"
 
 EXPLAIN = {
     "wsl-vm": "The WSL virtual machine as Windows sees it. Windows charges all GPU memory used by Linux processes "
-              "in every WSL distro (and WSLg) to vmwp.exe, so this is the exact total. The split across Linux "
-              "processes is not exposed.",
+              "in every WSL distro (and WSLg) to vmwp.exe, so measured VRAM is the exact total. The split across "
+              "Linux processes is not exposed.",
     "compositor": "Desktop Window Manager: its own back buffers and the composed image for each monitor. "
                   "Windows' 'Dedicated Usage' counter shows dwm as huge (it counts every app surface it can see); "
                   "this tool prefers Local Usage for attribution. The adapter counter is the total; "
@@ -106,9 +106,10 @@ listed, and the header says how many it couldn't; run with `sudo` to see other u
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL
 interop is enabled, the Windows host's counters are read through `powershell.exe`: **WSL VM**
-(`vmwp.exe`) is then the exact total of Linux GPU memory, and Windows apps appear as `W:<pid>`
-rows. `--no-host` turns this off. Linux rows get their VRAM by matching the VM's GPU contexts
-(newest first) to Linux processes: `*` when candidates agree on the size, `?` for a heuristic owner.
+(`vmwp.exe`) shows the exact total of Linux GPU memory when its VRAM counter is available, and
+Windows apps appear as `W:<pid>` rows. `--no-host` turns this off. Linux rows get their VRAM by
+matching the VM's GPU contexts (newest first) to Linux processes: `*` when candidates agree on the
+size, `?` for a heuristic owner.
 Cached foreign sizes only help rank guesses; they never prove ownership across runs.
 
 **Why does nvidia-smi say N/A?** GeForce cards on Windows run in *WDDM* mode: Windows, not the
@@ -147,7 +148,7 @@ All eight trend charts are visible by default. They stack in narrow terminals an
 share rows when there is room. Click the **Charts** dropdown to show all charts or
 one metric; `c` cycles the same choices. A blank sample means no reading; zero is
 drawn at the baseline. Percentage charts use 0–100%, temperature uses 0–120°C,
-and the power and SM clock scales are shown below the charts. In short terminals,
+and the power and clock scales are shown below the charts. In short terminals,
 scroll the dashboard or inspector without losing the process list.
 """
 
@@ -269,7 +270,7 @@ class GpuTaskManager(App):
 
     @property
     def selected_pid(self) -> int | None:
-        """PID of the selected local process; None for Windows (W:) and outside (H:) rows."""
+        """PID of the selected local process; None for Windows (W:) and host-PID (H:) rows."""
         key = self.selected_key
         pid = key.rsplit(":", 1)[-1] if key else ""
         return int(pid) if pid.isdigit() else None
@@ -372,7 +373,7 @@ class GpuTaskManager(App):
         self.hist_cpu.append(host.cpu_pct if host else None)
         self.hist_ram.append(100 * host.ram_used / host.ram_total if host and host.ram_total else None)
         for snap in snapshots:
-            for row in snap.procs:  # Windows (W:) / outside (H:) rows have no local pid: RAM/CPU stay unknown
+            for row in snap.procs:  # Windows (W:) / host-PID (H:) rows have no local pid: RAM/CPU stay unknown
                 hp = host.proc(row.pid, row.detail.create_time) if host and not row.host else None
                 row.ram, row.cpu = (hp.rss, hp.cpu_pct) if hp else (None, None)
         multi = len(snapshots) > 1
@@ -432,9 +433,21 @@ class GpuTaskManager(App):
         self.hist_vram.append(100 * snap.vram_used / snap.vram_total
                               if snap.vram_total and snap.vram_used is not None else None)
 
+    @staticmethod
+    def _clock_kind(snap: Snapshot) -> str:
+        if snap.adapter and snap.adapter.vendor_id == 0x1002:
+            return "GFX"
+        if snap.nv and snap.nv.source == "Intel sysfs":
+            return "GT"
+        return "SM"
+
     def render_dashboard(self) -> None:
-        amd = bool(self.snapshots[0].adapter and self.snapshots[0].adapter.vendor_id == 0x1002)
-        clock_label = "SM/GFX clock" if len(self.snapshots) > 1 else "GFX clock" if amd else "SM clock"
+        clock_kinds = {self._clock_kind(snap) for snap in self.snapshots}
+        if len(self.snapshots) > 1:
+            clock_label = ("/".join(kind for kind in ("SM", "GFX", "GT") if kind in clock_kinds) + " clock"
+                           if "GT" in clock_kinds else "SM/GFX clock")
+        else:
+            clock_label = f"{self._clock_kind(self.snapshots[0])} clock"
         if getattr(self, "_clock_label", None) != clock_label:
             self._clock_label = clock_label
             selector = self.query_one("#chart-mode", Select)
@@ -443,7 +456,7 @@ class GpuTaskManager(App):
                 (clock_label if self.CHARTS[index] == "SM clock" else self.CHARTS[index], index)
                 for index in self.available_charts)])
             selector.value = selected
-        self._amd_chart_labels = amd
+        self._clock_chart_label = self._clock_kind(self.snapshots[0])
         devices = []
         for index, snap in enumerate(self.snapshots):
             if len(self.snapshots) > 1:
@@ -535,7 +548,7 @@ class GpuTaskManager(App):
         # Fit category proportions to the adapter total; row samples need not sum exactly.
         by_kind: dict[str, float] = {}
         for r in s.procs:
-            if r.gpu.attributed:  # unknown shares stay in "unattributed" instead of showing as 0
+            if r.gpu.attributed and "dedicated" in r.gpu.available:
                 by_kind[r.kind] = by_kind.get(r.kind, 0) + r.gpu.dedicated
         attributed = sum(by_kind.values())
         scale = min(1.0, s.vram_used / attributed) if attributed and s.vram_used is not None else 1.0
@@ -649,7 +662,7 @@ class GpuTaskManager(App):
             for index, snap in enumerate(self.snapshots):
                 self.snap = snap
                 self._use_history(index)
-                self._amd_chart_labels = bool(snap.adapter and snap.adapter.vendor_id == 0x1002)
+                self._clock_chart_label = self._clock_kind(snap)
                 grid, note = self._chart_content()
                 charts.extend([Text(f"GPU {index}", style="bold"), grid])
                 notes.append(f"GPU {index}: {note}")
@@ -678,8 +691,8 @@ class GpuTaskManager(App):
             values, scale, unit, style = self.chart_series(index, self.snap.nv)
             current = values[-1] if values else None
             name = self.CHARTS[index]
-            if getattr(self, "_amd_chart_labels", False) and name == "SM clock":
-                name = "GFX clock"
+            if name == "SM clock":
+                name = f"{self._clock_chart_label} clock"
             cell = Text(f"{name:<12} ", style=style)
             cell.append(f"{format_metric(current, '.0f', unit):>8} ", style="bold")
             cell.append(spark(values, max(1, cell_width - 22), scale))
@@ -691,7 +704,7 @@ class GpuTaskManager(App):
         note = (
             "Recent samples · blank = no reading" if self.snap.backend == "metal" else
             f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
-            f"{'GFX' if getattr(self, '_amd_chart_labels', False) else 'SM'} clock 0–{clock_scale:.0f} MHz"
+            f"{self._clock_chart_label} clock 0–{clock_scale:.0f} MHz"
         )
         return grid, note
 
@@ -703,6 +716,7 @@ class GpuTaskManager(App):
         rows = s.procs
         if not self.show_all:
             rows = [r for r in rows if not r.gpu.attributed or r.gpu.dedicated >= 32 << 20 or r.gpu.gpu_pct >= 1 or r.gpu.shared >= 64 << 20
+                    or (r.gpu.wddm_dedicated_usage or 0) >= 32 << 20 or (r.gpu.wddm_shared_usage or 0) >= 64 << 20
                     or r.gpu.paged_out >= 128 << 20 or (r.gpu.graphics_swapped or 0) >= 128 << 20 or r.llm]
         rows = sorted(rows, key=self.sorts[self.sort_idx][1])
         vm = next((i for i, r in enumerate(rows) if r.kind == "wsl-vm"), None)
@@ -788,7 +802,7 @@ class GpuTaskManager(App):
         if r is None:
             panel.update(Text("Select a process (↑/↓) to see what's inside its GPU memory.  Press ? to learn what's knowable.", style="grey62"))
             return
-        where = {"windows": "Windows PID ", "outside": "host PID "}.get(r.origin, "") if r.host else ""
+        where = {"windows": "Windows PID ", "outside": "host PID ", "nvml": "host PID "}.get(r.origin, "") if r.host else ""
         panel.border_title = f"{r.name} ({where}{r.pid}) - {r.kind}"
         if r.gpu_index is not None:
             panel.border_title += " - GPU unknown" if s.backend == "wsl" and not r.host else f" - GPU {r.gpu_index}"
@@ -810,6 +824,10 @@ class GpuTaskManager(App):
             hdr.append("   runtime ", style="grey62")
             hdr.append(" ".join(r.detail.runtimes), style="cyan")
         out.append(hdr)
+        if s.backend == "nvml" and r.gpu.engine_reason:
+            out.append(Text(r.gpu.engine_reason, style="grey62"))
+        if wddm_fallback_note(r.gpu):
+            out.append(Text(wddm_fallback_note(r.gpu), style="grey62"))
         if not r.host and r.gpu.attributed and r.gpu.inferred_by:
             out.append(Text(inferred_note(r.gpu), style="grey62"))
         if not r.host and not r.gpu.attributed:
@@ -854,16 +872,18 @@ class GpuTaskManager(App):
                 out.append(Text("Model files, launch flags and runtime buffer logs can span GPUs. "
                                 "The breakdown below is not a measured per-device model placement.", style="grey70"))
             width = max(min(self.size.width - 8, 100), 20)
-            total = max(r.gpu.shown_vram or 0, sum(x.bytes for x in v.segments), 1)
+            budget = 0 if s.backend == "nvml" and r.gpu.inferred_by else (r.gpu.shown_vram or 0)
+            total = max(budget, sum(x.bytes for x in v.segments), 1)
             out.append(stacked_bar([(x.bytes, SEG_STYLE[x.kind]) for x in v.segments], total, width))
             legend = Text()
             for x in v.segments:
                 legend.append("■ ", style=SEG_STYLE[x.kind])
                 legend.append(f"{x.label} {gb(x.bytes)}", style="bold" if x.exact else "")
                 legend.append("  ")
-            if v.log_source:
-                legend.append(f"(allocated sizes from {os.path.basename(v.log_source)})", style="green")
             out.append(legend)
+            if v.log:
+                out.append(Text(LOG_HISTORY_LABEL, style="green"))
+                out.append(Text("\n".join(log_buffer_text(record, r.detail.create_time) for record in v.log)))
             if v.models:
                 mt = Table(box=None, padding=(0, 1), show_edge=False, header_style="bold grey70")
                 for col in ("", "model", "arch", "params", "quant", "layers", "train ctx", "on GPU (est)", "evidence", "file"):
@@ -886,7 +906,8 @@ class GpuTaskManager(App):
                 if sv.n_ctx:
                     st.append(f"  ctx {sv.n_ctx:,}")
                 if sv.slots_total is not None:
-                    st.append(f"  slots busy {sv.slots_busy}/{sv.slots_total}")
+                    busy = "n/a" if sv.slots_busy is None else str(sv.slots_busy)
+                    st.append(f"  slots busy {busy}/{sv.slots_total}")
                 if sv.gen_tok_s and sv.kind != "vllm":  # vLLM rates are derived; shown on their own line
                     st.append(f"  gen {sv.gen_tok_s:.1f} tok/s", style="bold green")
                 if sv.prompt_tok_s and sv.kind != "vllm":

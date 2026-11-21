@@ -75,9 +75,8 @@ public static class GtmPdh {
                     IntPtr item = buf + k * stride;
                     uint status = (uint)Marshal.ReadInt32(item, IntPtr.Size);
                     double value = BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, IntPtr.Size + 8));
-                    // Zero-size GPU contexts still matter: vmwp.exe's instances are matched to Linux
-                    // processes by position, so "local usage" keeps them; everything else drops zeros.
-                    if ((status != 0 && status != 1) || (value == 0 && i != 0)) continue;
+                    // A valid zero is a reading, including zero-size vmwp.exe contexts used for matching.
+                    if (status != 0 && status != 1) continue;
                     string name = Marshal.PtrToStringUni(Marshal.ReadIntPtr(item)).Replace("\\", "\\\\").Replace("\"", "\\\"");
                     if (!first) sb.Append(',');
                     first = false;
@@ -150,6 +149,13 @@ def parse_line(line: str, now: float | None = None) -> HostSample | None:
     adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
     contexts: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
     invalid_processes: set[tuple[int, int]] = set()
+
+    def proc(luid: int, pid: int) -> ProcGpu:
+        per_adapter = procs[luid]
+        if pid not in per_adapter:
+            per_adapter[pid] = ProcGpu(available=set())
+        return per_adapter[pid]
+
     for row in data.get("s") or []:
         try:
             counter, instance, value = str(row[0]).lower(), str(row[1]).lower(), float(row[2])
@@ -159,7 +165,7 @@ def parse_line(line: str, now: float | None = None) -> HostSample | None:
             m = _ENGINE_RE.match(instance)
             if m:
                 luid, pid = luid_key(m[2], m[3]), int(m[1])
-                g = procs[luid].setdefault(pid, ProcGpu())
+                g = proc(luid, pid)
                 if not valid_engine_counter(value):
                     g.engines.clear()
                     g.available.discard("engine")
@@ -167,14 +173,17 @@ def parse_line(line: str, now: float | None = None) -> HostSample | None:
                     invalid_processes.add((luid, pid))
                 elif (luid, pid) not in invalid_processes:
                     g.engines[_norm_engine(m[6])] += value
+                    g.available.add("engine")
         elif counter in _PROC_FIELDS:
             m = _PROC_RE.match(instance)
             if m:
-                g = procs[luid_key(m[2], m[3])].setdefault(int(m[1]), ProcGpu())
+                luid, pid = luid_key(m[2], m[3]), int(m[1])
+                g = proc(luid, pid)
                 attr = _PROC_FIELDS[counter]
                 setattr(g, attr, getattr(g, attr) + value)  # vmwp.exe has one instance per guest context
+                g.available.add(attr)
                 if attr == "dedicated":
-                    contexts[luid_key(m[2], m[3])][int(m[1])].append(value)
+                    contexts[luid][pid].append(value)
         elif counter in _ADAPTER_FIELDS:
             m = _ADAPTER_RE.match(instance)
             if m:
@@ -350,6 +359,7 @@ class ContextTracker:
     def _reset(self) -> None:
         self.entries: list[_Entry] | None = None
         self.seen: dict[object, float] = {}  # holder pid -> first seen
+        self.starts: dict[object, float] = {}  # holder pid -> latest known process start time
         self.initial: set = set()  # holders already running at the first sample
         self.gone: dict[object, float] = {}
 
@@ -413,33 +423,46 @@ class ContextTracker:
             self.luid, self.cached_foreign = luid, []
             self._reset()
         start = dict(holders)
+        replaced = set()
+        for pid, started in start.items():
+            if isinstance(started, (int, float)) and math.isfinite(started):
+                if pid in self.seen and pid in self.starts and self.starts[pid] != started:
+                    replaced.add(pid)
+                self.starts[pid] = started
         first = self.entries is None
         had_foreign = any(e.label == FOREIGN and e.sure for e in self.entries or [])
         cur = [_Entry(v) for v in contexts]
         fresh: list[_Entry] = []  # contexts that appeared since the previous sample
         if not first:
-            sure = {e.label for e in self.entries if e.sure}
+            sure = {e.label for e in self.entries if e.sure and e.label not in replaced}
             waiting = [p for p in start if p not in self.initial and p not in sure]  # new or lagging processes
-            exited = [p for p in self.seen if p not in start]
+            exited = [p for p in self.seen if p not in start or p in replaced]
             lingering = sum(1 for e in self.entries if isinstance(e.label, tuple))
             for e, old in zip(cur, self._align(self.entries, contexts, len(waiting), len(exited) + lingering)):
                 if old is None:
                     fresh.append(e)
                 else:
                     e.label, e.sure = old.label, old.sure
+                    if e.label in replaced:
+                        e.label, e.sure = ("gone", e.label), False
 
         for pid in start:
-            if pid not in self.seen:
+            if pid in replaced:
+                self.seen[pid] = now
+                self.initial.discard(pid)
+                self.gone[pid] = now
+            elif pid not in self.seen:
                 self.seen[pid] = now
                 self.gone.pop(pid, None)  # reused PID: not the process that exited
                 if first:
                     self.initial.add(pid)
         for pid in [p for p in self.seen if p not in start]:
             del self.seen[pid]
+            self.starts.pop(pid, None)
             self.initial.discard(pid)  # a reused PID is a new process, not one that was running at startup
             self.gone[pid] = now
         for e in cur:
-            if e.label in self.gone and not isinstance(e.label, tuple):
+            if e.label in self.gone and e.label not in start and not isinstance(e.label, tuple):
                 e.label, e.sure = ("gone", e.label), False
             if isinstance(e.label, tuple) and now - self.gone.get(e.label[1], 0) > self.GONE:
                 e.label = None

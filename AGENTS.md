@@ -15,6 +15,9 @@ these rules:
    `ProcGpu.dedicated` only. `ProcGpu.shown_vram` (`pdh.py`: measured, else inferred, else `None`)
    is for display, sorting, model selection, and scan priority, never for totals. Inferred WSL rows
    sit *under* the `vmwp.exe` VM total and are never added to it again.
+   Container local-owner guesses likewise use `inferred`, never measured bytes or engine readings.
+   Keep measured NVML counters on separate host-PID rows (`origin="nvml"`); those PIDs have unresolved
+   local ownership, not proof of being outside the container. Never budget model segments from a guess.
 2. **Unknown is not zero.** Unavailable counters are `null` in JSON and `n/a` or blank in the UI.
    A measured zero stays `0`. Engine availability is independent of VRAM availability.
 3. **Windows per-process memory uses `Local Usage` / `Non Local Usage`**, not `Dedicated Usage`,

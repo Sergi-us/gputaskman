@@ -4,7 +4,7 @@ Like `diff`, this only reads a saved file and collects nothing. Readings are tak
 skipped (never counted as 0), a metric with no readings is left out, and values are never capped or adjusted.
 Per-process memory comes only from the measured `vram_bytes`, so nothing inferred is summed.
 
-`record` appends, so one file can hold several recordings. A new run starts when the GPU or backend changes,
+`record` appends, so one file can hold several recordings. A new run starts when the adapter or backend changes,
 when `taken` goes backwards, or when two samples are further apart than RUN_GAP_FACTOR times the file's
 median interval (and at least RUN_GAP_MIN seconds). Each run is summarized on its own.
 """
@@ -16,6 +16,7 @@ import math
 import statistics
 import time
 
+from .diff import adapter_identity, compare_adapter_identities
 from .llm import gb
 
 RUN_GAP_FACTOR = 10
@@ -71,16 +72,44 @@ def load(path: str) -> tuple[list[dict], int]:
     return samples, skipped
 
 
+def _adapter_conflicts(known: dict, current: dict, sample: dict) -> bool:
+    try:
+        compare_adapter_identities(known, current, sample)
+    except ValueError:
+        return True
+    return False
+
+
 def split_runs(samples: list[dict]) -> list[list[dict]]:
     gaps = [b["taken"] - a["taken"] for a, b in zip(samples, samples[1:]) if b["taken"] > a["taken"]]
     limit = max(RUN_GAP_MIN, RUN_GAP_FACTOR * statistics.median(gaps)) if gaps else RUN_GAP_MIN
     runs: list[list[dict]] = []
+    identities: dict[tuple, dict[int | None, dict]] = {}
     for s in samples:
         prev = runs[-1][-1] if runs else None
-        if (prev is None or (s.get("gpu"), s.get("backend")) != (prev.get("gpu"), prev.get("backend"))
-                or not 0 <= s["taken"] - prev["taken"] <= limit):
+        identity = adapter_identity(s)
+        gpu, backend = s.get("gpu"), s.get("backend")
+        if backend == "wddm":
+            identity.pop("key", None)  # A Windows LUID alone cannot establish a conflict.
+        if "pci" not in identity:
+            identity.pop("pci_domain", None)
+        if (prev is None or (gpu, backend) != (prev.get("gpu"), prev.get("backend"))
+                or not 0 <= s["taken"] - prev["taken"] <= limit
+                or (identity and any(_adapter_conflicts(known, identity, s)
+                                     for keys in identities.values() for known in keys.values()))):
             runs.append([])
+            identities.clear()
         runs[-1].append(s)
+        if identity:
+            signature = tuple((field, value) for field, value in identity.items() if field != "key")
+            keys = identities.setdefault(signature, {})
+            key = identity.get("key")
+            # Two distinct keys already prove any future key-only mismatch for this signature.
+            if len(keys) < 2:
+                keys[key] = identity
+            elif None in keys and key is not None:
+                del keys[None]
+                keys[key] = identity
     return runs
 
 
@@ -180,7 +209,8 @@ def to_text(d: dict, top: int = TOP) -> str:
     if d["skipped_lines"]:
         out.append(f"{d['skipped_lines']} line(s) that do not parse as a snapshot were skipped.")
     if len(d["runs"]) > 1:
-        out.append(f"A new run starts when the GPU changes or samples are more than {RUN_GAP_FACTOR}x the usual "
+        out.append(f"A new run starts when the GPU adapter or backend changes, the clock goes backwards, "
+                   f"or samples are more than {RUN_GAP_FACTOR}x the usual "
                    f"interval (at least {RUN_GAP_MIN:g} s) apart.")
     out.append("Values are shown as recorded; unknown readings are skipped, not counted as 0.")
     for i, r in enumerate(d["runs"], 1):

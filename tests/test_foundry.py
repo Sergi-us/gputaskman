@@ -54,7 +54,7 @@ def collector(ports, *, started=1, available=None):
     c.adapter, c.adapters = None, []
     c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
     c.nvml = Mock(ok=False)
-    c.counters = Mock(outside={})
+    c.counters = Mock(host_procs={})
     gpu = ProcGpu(dedicated=512 * MiB, shared=0)
     if available is not None:
         gpu.available = set(available)

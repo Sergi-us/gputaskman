@@ -94,7 +94,7 @@ def collector(details, ports):
     c.adapter, c.adapters = None, []
     c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
     c.nvml = Mock(ok=False)
-    c.counters = Mock(outside={})
+    c.counters = Mock(host_procs={})
     c.counters.sample.return_value = (
         {0: {10: ProcGpu(dedicated=512 * MiB, shared=0, engines={"compute": 10})}},
         {0: AdapterGpu(dedicated=512 * MiB, shared=0)})

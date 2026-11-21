@@ -217,8 +217,8 @@ def nvidia_holders() -> set[int]:
 
 
 def has_cuda(pid: int) -> bool:
-    """libcuda.so mapped: the process has (or is creating) a CUDA context. NVML-only tools (nvidia-smi,
-    nvtop, this monitor) open the same device files but never load libcuda, so they don't count."""
+    """libcuda.so mapped: a CUDA candidate, not proof of context ownership. NVML-only tools such as
+    nvidia-smi open the same device files but do not load libcuda, so they don't count."""
     try:
         with open(f"/proc/{pid}/maps", encoding="utf-8", errors="replace") as f:
             return any("/libcuda.so" in line for line in f)
@@ -228,19 +228,20 @@ def has_cuda(pid: int) -> bool:
 
 class PidMatcher:
     """Containers: NVML reports *host* PIDs, which mean nothing in the container's /proc. Both PID
-    namespaces number processes in creation order, so the container's CUDA processes are matched to
-    NVML's unresolved PIDs by order. A match is sure ("consistent") when a new NVML PID and a new local
-    CUDA process appear together (kept while both live) or the counts are equal; otherwise newest is
-    paired with newest as an "order" guess, and leftover NVML PIDs belong to processes outside
-    this container (other containers, the host's display server)."""
+    namespaces number processes in creation order, so the container's local candidates are matched to
+    NVML's unresolved PIDs by order. A new NVML PID and a new local candidate appearing together keeps
+    a stable pair while both live, but does not prove ownership: a device handle, mapped libcuda, and
+    correlated starts do not establish that the local process owns that NVML context. Matches remain
+    "order" guesses unless ownership is uniquely established or all viable matches give the same bytes.
+    Unmatched NVML PIDs also have unresolved local ownership."""
 
     def __init__(self) -> None:
-        self.pairs: dict[int, int] = {}  # host pid -> local pid, from start events
+        self.pairs: dict[int, int] = {}  # host pid -> stable local candidate pairing
         self.prev_host: set[int] | None = None
         self.prev_local: set[int] = set()
 
     def update(self, host: list[int], local: list[int]) -> tuple[dict[int, tuple[int, str]], list[int]]:
-        """Returns ({host pid: (local pid, confidence)}, host pids left outside)."""
+        """Returns ({host pid: (local pid, confidence)}, unmatched host pids)."""
         first = self.prev_host is None
         hs, ls = set(host), set(local)
         self.pairs = {h: l for h, l in self.pairs.items() if h in hs and l in ls}
@@ -250,12 +251,11 @@ class PidMatcher:
             if len(new_h) == len(new_l) == 1:
                 self.pairs[new_h[0]] = new_l[0]
         self.prev_host, self.prev_local = hs, ls
-        out = {h: (l, "consistent") for h, l in self.pairs.items()}
+        out = {h: (l, "order") for h, l in self.pairs.items()}
         rest_h = sorted((h for h in host if h not in self.pairs), reverse=True)  # newest first
         rest_l = sorted((p for p in local if p not in self.pairs.values()), reverse=True)
-        sure = len(rest_h) == len(rest_l)
         for h, l in zip(rest_h, rest_l):
-            out[h] = (l, "consistent" if sure else "order")
+            out[h] = (l, "order")
         return out, rest_h[len(rest_l):]
 
 
@@ -275,10 +275,11 @@ class LinuxCounters:
         self._devices: list[tuple[int, object]] = []
         self._last_ts: dict[int, int] = {}
         self.dxg_holders: set[int] = set()
+        self.process_status: dict[int, str] = {}
         self._matcher = PidMatcher()
-        # {adapter key: {host pid: ProcGpu}}: NVML processes in another PID namespace that couldn't be
-        # matched to a local process. Their PIDs must never be looked up in this /proc.
-        self.outside: dict[int, dict[int, ProcGpu]] = {}
+        # Measured NVML counters keyed by host PID; local ownership is unresolved.
+        # These PIDs must never be looked up in this /proc.
+        self.host_procs: dict[int, dict[int, ProcGpu]] = {}
         # AMD (amdgpu) and Intel (i915/xe) GPUs: per-process VRAM/GTT and engine time from DRM
         # fdinfo. Native Linux only;
         # under WSL the GPU is /dev/dxg and no DRM driver is involved.
@@ -308,11 +309,11 @@ class LinuxCounters:
             self._devices = []
 
     @staticmethod
-    def _processes(fn, h) -> list:
+    def _processes(fn, h) -> tuple[list, Exception | None]:
         try:
-            return list(fn(h))
-        except Exception:
-            return []
+            return list(fn(h)), None
+        except Exception as error:
+            return [], error
 
     def _utilization(self, key: int, h) -> dict[int, object]:
         """Latest utilization sample per PID since the previous call."""
@@ -333,6 +334,7 @@ class LinuxCounters:
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
         self._compute_pids: set[int] = set()
         self.dxg_holders = set()
+        self.process_status = {}
         for key, h in self._devices:
             try:
                 adapters[key].dedicated = float(N.nvmlDeviceGetMemoryInfo(h).used)
@@ -340,8 +342,15 @@ class LinuxCounters:
                 pass
             if self.wsl:
                 continue  # NVML per-process data is empty or keyed by Windows host PIDs here
-            compute = self._processes(N.nvmlDeviceGetComputeRunningProcesses, h)
-            graphics = self._processes(N.nvmlDeviceGetGraphicsRunningProcesses, h)
+            compute, compute_error = self._processes(N.nvmlDeviceGetComputeRunningProcesses, h)
+            graphics, graphics_error = self._processes(N.nvmlDeviceGetGraphicsRunningProcesses, h)
+            failures = [
+                f"{kind} process list failed ({type(error).__name__}: {error})"
+                for kind, error in (("compute", compute_error), ("graphics", graphics_error))
+                if error is not None
+            ]
+            if failures:
+                self.process_status[key] = "NVML " + "; ".join(failures) + "; attributed total is unknown."
             compute_pids = {p.pid for p in compute}
             self._compute_pids |= compute_pids
             per = procs[key]
@@ -382,17 +391,14 @@ class LinuxCounters:
         return procs, adapters
 
     def _resolve_namespaces(self, procs: dict[int, dict[int, ProcGpu]]) -> None:
-        """Re-key NVML's PIDs to local ones. In the host PID namespace (bare metal, --pid=host) they already
-        are local, including other users' processes whose /proc/<pid>/fd this monitor can't read. In a
-        container's own namespace every NVML PID is a host PID, even one that happens to equal a local
-        PID, so all of them are matched by creation order with PidMatcher."""
-        self.outside = {}
+        """Keep measured host counters apart from guessed local owners. In the host PID namespace
+        (bare metal, --pid=host) NVML PIDs already are local, including other users' processes. In a
+        child namespace every NVML PID is a host PID, even one that happens to equal a local PID;
+        PidMatcher supplies only local display hints, not measured counters."""
+        self.host_procs = {}
         nv_pids = {pid for per in procs.values() for pid in per}
-        child = in_child_pid_namespace()
-        if child is None:  # unknown: PIDs that don't exist here can't be local
-            unresolved = sorted(pid for pid in nv_pids if not os.path.exists(f"/proc/{pid}"))
-        else:
-            unresolved = sorted(nv_pids) if child else []
+        # A coincidentally existing /proc PID cannot prove ownership if namespace detection failed.
+        unresolved = sorted(nv_pids) if in_child_pid_namespace() is not False else []
         if not unresolved:
             self._matcher.update([], [])
             return
@@ -403,15 +409,20 @@ class LinuxCounters:
         matched, _ = self._matcher.update(compute, local)
         unresolved = set(unresolved)
         for key, per in procs.items():
-            moved: dict[int, ProcGpu] = {}  # kept apart: a local PID may equal a host PID not yet moved
+            moved: dict[int, ProcGpu] = {}  # a local candidate PID may equal a host PID not yet removed
             for pid in [p for p in per if p in unresolved]:
                 g = per.pop(pid)
+                self.host_procs.setdefault(key, {})[pid] = g
+                if not g.attributed:
+                    g.dedicated = 0.0
+                    g.available.discard("dedicated")
                 if pid in matched:
                     lpid, confidence = matched[pid]
-                    g.inferred_by = confidence
-                    moved[lpid] = g
-                else:
-                    self.outside.setdefault(key, {})[pid] = g
+                    moved[lpid] = ProcGpu(
+                        attributed=False, inferred=g.shown_vram, inferred_by=confidence,
+                        available=set(),
+                        engine_reason="NVML engines are measured for a host PID; its local owner is unresolved.",
+                    )
             per.update(moved)
 
     def close(self) -> None:

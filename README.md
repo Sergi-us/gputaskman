@@ -159,7 +159,7 @@ Ascend container and PID-namespace behavior is not validated.
 | | Native Linux | WSL, interop on (default) | WSL, interop off or `--no-host` |
 |---|---|---|---|
 | Device totals, load, temperature, power, clocks | NVML / DRM | NVML / AMD SMI | NVML / AMD SMI |
-| Per-process VRAM | NVML, measured (in a container: owner matched, `*` or `?`) | Matched from the Windows host, marked `*` or `?` | `n/a` |
+| Per-process VRAM | NVML, measured by host PID; in a container, local-owner guesses are separate (`?`) | Matched from the Windows host, marked `*` or `?` | `n/a` |
 | Per-process GPU load | NVML (SM, encoder, decoder) | `n/a` for Linux processes | `n/a` |
 | Spill / Paged | Not available (blank) | Windows rows only | Not available |
 | WSL VM total, Windows apps | — | Windows host counters | — |
@@ -179,14 +179,36 @@ PIDs, which mean nothing in the container's `/proc`, and the container cannot se
 its own processes. gputaskman pairs NVML's unresolved PIDs with the container's processes that
 have `libcuda.so` mapped (NVML-only tools such as `nvidia-smi` open the same device files but
 never load libcuda). Both PID namespaces number processes in creation order, so the pairing is by
-order: `*` when the counts match or a process starting while gputaskman runs pins it, `?` when
-NVML lists more compute processes than the container has (another container on the same GPU).
-Per-process GPU load follows the match. Anything left over is shown as `H:<pid>`,
-*outside this container* (for example, the host's display server), and is never looked up locally.
+order: `?` marks an order guess, even when candidate counts match or a new NVML PID and local
+candidate appear together while gputaskman runs. Those starts keep a pairing stable, but do not prove
+ownership. A device handle and mapped `libcuda.so` do not prove that a process owns a live NVML context,
+and another container may have the same number of GPU processes. `*` is reserved for a unique ownership
+explanation or when all viable matches give exactly the same bytes.
+
+Guessed local rows carry `vram_attributed: false`, `vram_bytes: null` and the candidate's bytes in
+`vram_inferred_bytes` with `vram_inferred_by: "order"`. They are display hints, not measured process
+peaks in `summary` or a budget for a model breakdown. Local GPU% and engines are `null` with an
+`engine_unavailable_reason`: the host's engine readings do not establish which local process did the work.
+Independently evidenced model files still supply metadata and model/flag-based estimates, with an
+explicitly unknown process VRAM total; neither those estimates nor the mapped file prove GPU ownership.
+Recognized LLM runtime names/signatures can still query their own exclusive listeners for API evidence
+without a mapped model file; a generic process's path-argument or installed-model hints cannot enable a probe.
+Every NVML host PID is retained as `H:<pid>` / `(unresolved host PID)` (`host: "nvml"` in JSON), never
+looked up locally. Those rows preserve measured memory and engine counters under the driver's actual
+PID. Only their measured bytes enter the attributed total, once, not again through a local guess.
+Hidden host memory leaves that total unknown. These host processes may be local to this container,
+in another container, or on the host; an unmatched PID is not proof that it is outside this container.
+If PID-namespace detection fails, the same conservative split applies: an existing local PID with the
+same number does not prove that it is NVML's host process.
 
 Live check, on a Vast.ai Docker container (Ubuntu 22.04, RTX 3060 Ti, driver 580.82.09): two
 PyTorch jobs already running at startup, a third started while watching, and one killed, were all
 matched to the right container PIDs with their NVML sizes (1.12, 2.52 and 1.59 GB) and live GPU%.
+The startup matches are order guesses; this check does not validate the ambiguous equal-count,
+cross-container case. A process started while watching remains an order guess; its pair is merely
+kept stable by the observed start. The earlier live GPU% values followed guessed matches; they are now
+retained only under the measured host PID. The revised dual-row presentation is covered by synthetic
+tests, not a new hardware validation.
 An Ollama `qwen3:0.6b` runner was detected and named from Ollama's store with `api+mapped+cmdline`
 evidence, its weights / KV-cache / compute split shown, and the TUI rendered.
 
@@ -195,8 +217,9 @@ laptop with an RTX 4050 Laptop GPU (driver 620.70.06) and an AMD Phoenix iGPU: e
 matched `nvidia-smi` (a llama-server with Qwen2.5-1.5B Q4_K_M at `-ngl 99 -c 4096` showed 1.19 GB
 against 1218 MiB, and `gputaskman diff` put the device change at +1.20 GB, against +1224 MiB from
 `nvidia-smi`). The model was identified with `api+mapped+cmdline` evidence, and with
-`-lv 4 --log-file` the exact CUDA0 buffer sizes (935 MB weights, 112 MB KV cache) matched the
-GGUF-based estimates. During generation the TUI showed the server at 96% GPU% against 95% from
+`-lv 4 --log-file` the runtime-reported CUDA0 load-time sizes (935 MB weights, 112 MB KV cache)
+matched the GGUF-based estimates; these log events are history, not current allocation measurements.
+During generation the TUI showed the server at 96% GPU% against 95% from
 `nvidia-smi pmon`.
 
 **AMD GPUs on native Linux** (the `amdgpu` driver) need no ROCm, AMD SMI, or extra package: the
@@ -214,11 +237,15 @@ reporting a VRAM vendor, a heuristic validated on one APU) GTT is the GPU's norm
 is only a RAM carve-out, so GTT is still shown but never flagged as spill, and an LLM's memory is its
 VRAM plus GTT. The SDMA engine (`dma`) fills the COPY column. Paged stays blank: there is no commit
 counter. VRAM and Shared are charged to a process only when nothing else can hold its bytes: each of
-its DRM clients has exactly one visible holder, was opened through a render node (`/dev/dri/renderD*`),
-and reports zero bytes in every `drm-shared-*` region. Then its resident VRAM and GTT are its own and add
+its DRM clients has a usable `drm-client-id` and exactly one visible holder, was opened through a
+render node (`/dev/dri/renderD*`), and reports zero bytes in every `drm-shared-*` region.
+Then its resident VRAM and GTT are its own and add
 up without double counting. Otherwise the process shows VRAM and Shared as `n/a` (`null` in JSON, with
 `vram_unattributed_reason`) and its bytes stay in *unattributed*:
 
+- **Missing client identity**: fdinfo has no usable `drm-client-id`. Duplicate descriptors or
+  another holder of the same client can't be ruled out, so GPU% is `n/a` too
+  (`engine_unavailable_reason: "client_id"` in JSON).
 - **Shared client** (fd passing, fork; 1Password and its crash handler on the test desktop): one set of
   counters, and nothing says which process uses it. GPU% is `n/a` too.
 - **Shared buffers** (a window a compositor imports, video frames): `drm-shared-*` counts a buffer by
@@ -342,11 +369,15 @@ process, `vmwp.exe`. When WSL interop is enabled (`/proc/sys/fs/binfmt_misc/WSLI
 `enabled`), gputaskman starts one long-lived `powershell.exe` that reads the Windows GPU counters
 through the same PDH array API as the Windows backend and streams them back once a second:
 
-- **WSL VM (`vmwp.exe`)** is the exact total of Linux GPU memory, across every distro, WSLg, and
-  Docker Desktop.
+- **WSL VM (`vmwp.exe`)** reports the exact total of Linux GPU memory, across every distro, WSLg,
+  and Docker Desktop, when the host provides its Local Usage counter.
 - **Windows apps** appear as `W:<pid>` rows with their VRAM, shared system memory, paged, and engine load.
   Windows and Linux PIDs are separate namespaces, so the prefix keeps them apart.
 - **Linux rows** get a size by matching `vmwp.exe`'s GPU contexts to Linux processes (below).
+
+Each host counter is tracked separately: missing readings are `null` in JSON and `n/a` or blank on
+screen, not measured zeros. Engine load can still be available when memory is unknown. Paged is an
+estimate shown only when Local Usage, Non Local Usage, and Total Committed were all observed.
 
 The first host sample takes about 2.5 s; the TUI shows `starting` until then, and `--once` waits
 for it. The host adapter is paired with the NVML or AMD SMI device by memory usage, because WSL's adapter
@@ -484,11 +515,18 @@ macOS exposes without root:
 
 Other users' processes (WindowServer, system daemons) show GPU% with memory `n/a`: `footprint` needs
 root for them. Idle ones are left out of the table, except WindowServer. Run with `sudo` to measure
-every process's memory. `footprint` takes ~70 ms per process, so it runs in a background thread:
+every process's memory. The attributed total is unknown whenever a Metal client's footprint is
+unmeasured, even if its row is hidden. Device allocation and per-process GPU time remain independent.
+`footprint` takes ~70 ms per process, so it runs in a background thread:
 busy processes and new ones every pass (~2 s), idle ones every 30 s. A new process shows `n/a` for a
 second or two until its first measurement; a single failed measurement keeps the last size, and three
 in a row back off for a minute. Measurements are tied to the process's start time, so a reused PID
 never shows the previous process's numbers.
+
+If the Metal client query fails or times out, per-process GPU readings are unavailable for that
+refresh. JSON reports `attributed: null` with a reason in `counter_status`; a successful empty
+query still reports `attributed: 0`. Device readings are independent and still appear if available.
+The next successful query resumes GPU rates from the last successful sample.
 
 Metal reports one GPU time per process, with no 3D/compute/copy/video split, so those columns show
 `n/a`; a Metal process above 10% GPU is classified `3D/game` unless something more specific applies
@@ -526,7 +564,7 @@ for a privacy consent prompt.
   and load, never GPU memory (see [System RAM and CPU](#system-ram-and-cpu)).
 - **Model inspector:** which model each process holds (LLM, decision, embedding, speech, or diffusion), how
   it was identified, architecture, quantization, layer count, weights, estimated KV cost, and
-  buffer sizes from compatible load logs.
+  timestamped load-log history. Log sizes describe allocations at load time, not current residency.
 - **Live server hints:** context size, busy slots, throughput when available, and friendly Ollama
   or LM Studio model names.
 - **Scriptable output:** one-shot text and JSON, using the same collector as the TUI.
@@ -588,7 +626,7 @@ and SM/GFX clock, throttling alerts, charts, processes, and process inspection r
 The header border names the active mode; press `m` again to restore the full details.
 This is a session-only display toggle, applies to every GPU, and does not change collection
 or one-shot text/JSON output.
-All eight history charts are shown by default: GPU, SM clock (GFX clock on AMD), VRAM, memory activity,
+All eight history charts are shown by default: GPU, SM clock (GFX on AMD, GT on Intel), VRAM, memory activity,
 temperature, power, encoder, and decoder. They stack in narrow terminals and share rows as
 the window widens. Click the **Charts** dropdown to focus on one metric or return to **All charts**.
 A blank sample means no reading; zero is drawn at the baseline. Percentages use a 0–100%
@@ -637,7 +675,10 @@ two devices by memory usage; Linux processes are listed once with GPU `?`, becau
 does not identify their GPU. `--gpu N` retains the existing single-device host matching.
 
 `--list-gpus` lists selectable non-software DXGI adapters on Windows (including root-enumerated
-display adapters), or hardware adapters on other platforms, with their vendor and adapter key. `--gpu N` selects
+display adapters), or hardware adapters on other platforms, with their vendor and adapter key.
+"Microsoft Basic Render Driver" (WARP, Windows' CPU rasterizer) is hidden even when Windows lists it
+without the software flag in place of a display adapter whose driver is missing or disabled; it has no
+GPU memory or engines to show. `--list-gpus` names hidden adapters on stderr. `--gpu N` selects
 one of these adapters: NVIDIA adapters are listed first, followed by other vendors, with each
 group ordered by dedicated memory. An out-of-range
 index is rejected rather than silently selecting another device. Compute-only devices such as an
@@ -779,8 +820,11 @@ is listed as evidence that the process opened or named it, not as GPU growth. Th
 
 Processes are paired by PID, then by name and listening ports, then by a unique name, because a
 model reload often restarts the server under a new PID. A process missing from one snapshot shows
-`not listed`, not zero: it was not running or used too little GPU to be listed. Processes that
-moved by less than 16 MB are hidden from the text output but included in `--json`.
+`not listed`, not zero: it was not running or used too little GPU to be listed. Small numeric
+changes below 16 MB don't make a process appear in the text output on their own. If a measured or
+inferred process memory counter becomes known or unknown, the text shows both readings and `N/A`
+for the change rather than subtracting from zero. `--json` includes all processes and uses `null`
+when a delta can't be calculated.
 
 A PID is not an identity, because both Windows and Linux reuse them. Each process in `--json` carries
 `started_at` (its creation time in Unix seconds, taken from data the monitor already reads). The same
@@ -866,6 +910,8 @@ do not parse, such as a last line cut short, are skipped and counted.
 Because `record` appends, one file can hold several recordings, and `summary` reports each run on its own.
 A new run starts when the GPU or backend changes, when `taken` goes backwards (a clock change), or when
 two samples are further apart than ten times the file's median interval or 60 seconds, whichever is longer.
+A snapshot that conflicts with a known adapter identity from earlier in the run starts a new run,
+even if the GPUs share a name and some intervening snapshots have no adapter identity.
 A slow sample or two stays inside its run; recording again tomorrow into the same file is a second run.
 
 ### Replaying a recording
@@ -929,6 +975,18 @@ between processes. The same surface may appear against its application, `csrss.e
 `Non Local Usage`; it falls back to `Dedicated Usage` / `Shared Usage` when the preferred
 counters cannot be added. The adapter total remains the reference. See Microsoft's
 [GPU accounting explanation](https://devblogs.microsoft.com/directx/gpus-in-the-task-manager/).
+Fallback readings are shown separately in the process inspector and one-shot text, named
+`Dedicated Usage` or `Shared Usage`; they can overlap and are not charged bytes. JSON exposes
+them as `wddm_dedicated_usage_bytes` and `wddm_shared_usage_bytes`, with
+`vram_counter_source` and `shared_counter_source` identifying the selected counter for each
+row. The corresponding charged `vram_bytes` or `shared_bytes` is `null`, and attributed VRAM
+is unknown when the dedicated fallback is selected, even if no process row is visible.
+If neither dedicated process counter can be added, attributed VRAM is also unknown and the
+counter status explains why. If neither shared process counter can be added, shared memory and
+Paged are unknown, with a reason; measured dedicated attribution remains available.
+Preferred counters continue to be reported as `Local Usage` and `Non Local Usage`.
+Replay shows recorded fallback readings in the process note.
+Fallback-counter behavior has not been validated on hardware where the preferred counters are unavailable.
 
 In one live sample, DWM's older counter read about 15.3 GiB while `Local Usage` was about
 1.4 GiB. The latter reduced the inflated process sum substantially. This is an observed
@@ -942,7 +1000,7 @@ fallback and slower inference, but the counter alone cannot establish why it was
 
 **Paged is an estimate:** `max(Total Committed - Local Usage - Non Local Usage, 0)`.
 It is not an eviction trace, a pagefile measurement, or proof that Windows just moved
-those bytes out of VRAM. The value is also less reliable when fallback counters are in use.
+those bytes out of VRAM. It is unavailable if either process memory counter uses a fallback.
 
 Memory labels currently use `GB` / `MB` for binary units (GiB / MiB). The `Mem activity`
 reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**.
@@ -1197,11 +1255,15 @@ the worker's key is never sent there. A 401 is shown as **Parent-process API loc
 Probe caches separate own/parent origins, process creation times, runtime and credentials, so
 an authenticated own-port result cannot silently satisfy a parent request.
 
-Ollama's local `server.log` is considered when one Ollama runner is detected. Log formats,
-rotation, and stale load blocks can affect attribution, so compare the reported model and
-process when interpreting logs. Log sizes describe allocations at load time, not necessarily
-which pages remain resident now. An inferred remainder is runtime/unknown overhead, not an
-exact measurement of the CUDA context.
+Ollama's local `server.log` is considered when one Ollama runner is detected. The monitor reads at
+most 512 KiB from the tail and shows recent runtime-reported buffer records in a separate history
+section in text and the inspector. Each record uses only its own timestamp, if present. Records
+are not summed or assumed to describe the same load, and never enter the current allocation
+breakdown. In JSON, `llm.log_history` lists the device, buffer kind, bytes, timestamp, and
+`timestamp_issue` for each record, separately from current `segments`. Missing timestamps are
+`null`; timezone-free or unusable timestamps are not compared to process start.
+Any inferred remainder in the current breakdown is runtime/unknown overhead, not an exact
+measurement of the CUDA context.
 
 Without logs, estimates assume llama.cpp-style placement. Architecture, partial offload,
 KV quantization, sliding-window attention, and multiple models in one process can all change
@@ -1238,7 +1300,8 @@ file paths, but model and process names still require review.
 | WSL: `unmatched` | No Windows adapter's usage matched the NVML device; multi-GPU WSL is not validated |
 | WSL: Linux rows show `?` | Processes were running before gputaskman started; they become `*` with evidence (see the matching table) |
 | Linux: a GPU process is missing | Processes owned by other users need `sudo`; Docker and other WSL distros are not visible from this one |
-| Linux container: `H:<pid>` rows | GPU processes outside this container's PID namespace (host or other containers); NVML sees them, the container cannot name them |
+| Linux: NVML process list failed | The attributed total is unknown; check the reported NVML error and retry after restoring process-list access |
+| Linux container: `H:<pid>` rows | NVML's host PIDs with unresolved local ownership; possibly this container, another container, or the host. Measured counters stay here; local order guesses are separate |
 | Missing DLLs or model details | Protected processes may deny inspection; basic counters can still work without elevation |
 | No exact LLM breakdown | Enable compatible buffer logging, or use the GGUF estimate; API/log access is optional |
 | The screen looks cramped | Widen the terminal or use `--once` / `--json` |

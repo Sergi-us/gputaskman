@@ -33,8 +33,8 @@ from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
 from gputaskman.host import HostSample
 from gputaskman.llm import (LlmView, ServerInfo, ServerProber, _get, api_key, build_view, is_gpu_device,
-                            llama_server_models, lmstudio_models, parse_flags, parse_load_log, probe_server,
-                            redact_cmdline)
+                            llama_server_models, lmstudio_models, ollama_models, parse_flags, parse_load_log,
+                            probe_server, redact_cmdline)
 from gputaskman.nvml import NvDevice, Nvml
 from gputaskman.pdh import AdapterGpu, GpuCounters, ProcGpu
 from gputaskman.procinfo import (AI_KINDS, AMBIGUOUS_EXTS, MODEL_EXTS, PATH_ARG_CANDIDATES, PATH_ARG_TOKENS,
@@ -422,6 +422,12 @@ class DeviceSelectionTests(unittest.TestCase):
         self.assertIsNone(select_nv_device(gpu, [nv_gpu, nv_gpu], 0))
         intel = Adapter(2, "Intel GPU", 0x8086, 8 * GiB, 0, False)
         self.assertIsNone(select_nv_device(intel, [nv_gpu], 0))
+        # Windows reports PCI segment 15 bus 1 as bus 0xF01 (RTX Spark N1X, driver 621.14).
+        spark = Adapter(3, "NVIDIA RTX Spark N1X", 0x10DE, 80 * GiB, 0, False, (0xF01, 0, 0))
+        nv_spark = NvDevice(index=0, pci_bus="0000000F:01:00.0", driver_model="WDDM")
+        nv_bus1 = NvDevice(index=1, pci_bus="00000000:01:00.0", driver_model="WDDM")
+        self.assertIs(select_nv_device(spark, [npu, nv_bus1, nv_spark], 0), nv_spark)
+        self.assertIsNone(select_nv_device(spark, [npu, nv_bus1], 0))
 
     @patch("gputaskman.collector.sys.platform", "win32")
     def test_mcdm_peer_in_another_domain_does_not_hide_wddm_telemetry(self):
@@ -442,13 +448,48 @@ class DeviceSelectionTests(unittest.TestCase):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_one_shot_scans_every_live_process_and_tui_stays_budgeted(self):
+        adapter = Adapter(1, "RTX", 0x10DE, 16 * GiB, 0, False)
+        procs = {
+            pid: ProcGpu(dedicated=(27 - pid) * MiB, shared=0)
+            for pid in range(1, 27)
+        }
+
+        def make_collector(scan_budget):
+            c = Collector.__new__(Collector)
+            c.adapter, c.adapters = adapter, [adapter]
+            c.drm_card = None
+            c.gpu_index, c.scan_budget, c.host, c.host_status = 0, scan_budget, None, ""
+            c.nvml = Mock(ok=False)
+            c.counters = Mock(host_procs={})
+            c.counters.sample.return_value = (
+                {1: procs}, {1: AdapterGpu(dedicated=351 * MiB, shared=0)})
+            c.inspector, c.prober = Mock(), Mock()
+            c.inspector.get.side_effect = lambda pid: ProcDetail(pid, f"process-{pid}.exe")
+            c.inspector.needs_scan.return_value = True
+            return c
+
+        one_shot = make_collector(None)
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            snap = one_shot.sample()
+        self.assertEqual(len(snap.procs), 26)
+        self.assertEqual([call.args[0].pid for call in one_shot.inspector.scan.call_args_list],
+                         list(range(1, 27)))
+
+        tui = make_collector(0.15)
+        perf_times = iter([0, 0.01, 0.02, 0.03, 0.16])
+        with patch("gputaskman.collector.BACKEND", "wddm"), \
+                patch("gputaskman.collector.time.perf_counter", side_effect=lambda: next(perf_times, 0.16)):
+            tui.sample()
+        self.assertEqual([call.args[0].pid for call in tui.inspector.scan.call_args_list], [1, 2, 3])
+
     def test_missing_wsl_stack_is_unknown_with_reason_in_text_json_and_ui(self):
         c = Collector.__new__(Collector)
         c.adapter, c.adapters = None, []
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
         c.amdsmi = Mock(status="")
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = ({}, {})
         c.inspector, c.prober = Mock(), Mock()
         reason = "AMD SMI unavailable; install matching WSL AMD SMI and ROCDXG packages yourself."
@@ -470,7 +511,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [c.adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {0x4bf1: {4: ProcGpu(dedicated=GiB, engines={"compute": 10})}},
             {0x4bf1: AdapterGpu(dedicated=GiB, shared=0)})
@@ -505,7 +546,7 @@ class MemoryTests(unittest.TestCase):
                 c.nvml.sample.return_value = []
                 c.adl, c.amdsmi = Mock(), Mock()
                 c.adl.sample.return_value = amd_telemetry
-                c.counters = Mock(outside={})
+                c.counters = Mock(host_procs={})
                 c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=0, shared=0)})
                 c.inspector, c.prober = Mock(), Mock()
                 with patch("gputaskman.collector.BACKEND", "wddm"):
@@ -519,7 +560,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [c.adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {1: {}}, {1: AdapterGpu(util_gpu=41.6)})
         c.inspector, c.prober = Mock(), Mock()
@@ -538,7 +579,7 @@ class MemoryTests(unittest.TestCase):
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c._windows_driver = "32.0.163.2"
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(util_gpu=41.6)})
         c.inspector, c.prober = Mock(), Mock()
         with patch("gputaskman.collector.BACKEND", "wddm"):
@@ -554,7 +595,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {1: {42: ProcGpu(dedicated=memory, shared=0, committed=memory)}},
             {1: AdapterGpu(dedicated=0, shared=memory, util_gpu=41.6)})
@@ -595,7 +636,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {1: {42: ProcGpu(dedicated=memory, shared=0, committed=memory)}},
             {1: AdapterGpu(dedicated=0, shared=memory, util_gpu=41.6)})
@@ -626,7 +667,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {1: {
                 42: ProcGpu(dedicated=5 * MiB, shared=0),
@@ -649,7 +690,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {1: {42: ProcGpu(dedicated=5 * MiB, shared=0, available={"dedicated", "committed", "engine"})}},
             {1: AdapterGpu(dedicated=0, shared=5 * MiB)})
@@ -670,7 +711,7 @@ class MemoryTests(unittest.TestCase):
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=True, driver="", cuda_version="")
         c.nvml.sample.return_value = []
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=GiB, shared=0)})
         c.inspector, c.prober = Mock(), Mock()
         with patch("gputaskman.collector.BACKEND", "wddm"), \
@@ -688,7 +729,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [c.adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {2: {4: ProcGpu(dedicated=GiB)}},
             {2: AdapterGpu(dedicated=GiB, shared=GiB), 1: AdapterGpu(dedicated=0, shared=0)})
@@ -706,7 +747,7 @@ class MemoryTests(unittest.TestCase):
         c.adapters = [c.adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = ({1: {}}, {})
         c.inspector, c.prober = Mock(), Mock()
         with patch("gputaskman.collector.BACKEND", "wddm"):
@@ -737,6 +778,23 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(gpu.dedicated, 0)
         self.assertEqual(gpu.gpu_pct, 10)
         self.assertFalse(gpu.paged_available)
+
+    def test_engine_only_process_does_not_claim_unavailable_vram_attribution(self):
+        counters = GpuCounters.__new__(GpuCounters)
+        counters._query = None
+        counters.fallback_counters = {"dedicated"}
+        data = {"engine": [("pid_42_luid_0x0_0x1_phys_0_eng_0_engtype_Compute", 10.0)]}
+        with patch.object(counters, "_read", side_effect=lambda key: data.get(key, [])), \
+                patch("gputaskman.pdh._pdh", SimpleNamespace(PdhCollectQueryData=lambda query: 0)):
+            processes, _ = counters.sample()
+        s = snapshot()
+        s.procs = [ProcRow(42, "compute.exe", "compute", processes[1][42], ProcDetail(42, "compute.exe"))]
+        row = to_dict(s)["processes"][0]
+        self.assertFalse(row["vram_attributed"])
+        self.assertIsNone(row["vram_bytes"])
+        self.assertIsNone(row["wddm_dedicated_usage_bytes"])
+        self.assertEqual(row["gpu_pct"], 10)
+        self.assertIsNone(row["paged_out_bytes"])
 
     def test_invalid_engine_counter_makes_process_unknown_but_keeps_ordinary_overshoot(self):
         counters = GpuCounters.__new__(GpuCounters)
@@ -828,6 +886,150 @@ class MemoryTests(unittest.TestCase):
     def test_local_counters_are_preferred(self):
         self.assertTrue(GpuCounters._COUNTERS["dedicated"][0].endswith(r"\Local Usage"))
         self.assertTrue(GpuCounters._COUNTERS["shared"][0].endswith(r"\Non Local Usage"))
+
+    def test_windows_fallback_selection_and_independent_counters(self):
+        names = [f"pid_{pid}_luid_0x0_0x1_phys_0" for pid in (42, 43)]
+        for fallback in (set(), {"dedicated"}, {"shared"}, {"dedicated", "shared"}):
+            with self.subTest(fallback=fallback):
+                def add(query, path, user, handle):
+                    for key in fallback:
+                        if path == GpuCounters._COUNTERS[key][0]:
+                            return 1
+                    return 0
+
+                pdh = SimpleNamespace(PdhOpenQueryW=lambda *args: 0, PdhAddEnglishCounterW=add,
+                                      PdhCollectQueryData=lambda *args: 0)
+                data = {"dedicated": [(n, 512 * MiB) for n in names],
+                        "shared": [(n, 0) for n in names],
+                        "committed": [(n, GiB) for n in names],
+                        "engine": [(names[0] + "_eng_0_engtype_Compute", 42)],
+                        "a_dedicated": [("luid_0x0_0x1_phys_0", 512 * MiB)],
+                        "a_shared": [("luid_0x0_0x1_phys_0", 0)]}
+                with patch("gputaskman.pdh._load_pdh"), patch("gputaskman.pdh._pdh", pdh):
+                    counters = GpuCounters()
+                    self.assertEqual(counters.fallback_counters, fallback)
+                    with patch.object(counters, "_read", side_effect=lambda key: data.get(key, [])):
+                        processes, adapters = counters.sample()
+                self.assertEqual(adapters[1].dedicated, 512 * MiB)
+                self.assertEqual(processes[1][42].gpu_pct, 42)
+                for gpu in processes[1].values():
+                    self.assertEqual(gpu.wddm_dedicated_usage, 512 * MiB if "dedicated" in fallback else None)
+                    self.assertEqual(gpu.wddm_shared_usage, 0 if "shared" in fallback else None)
+                    self.assertEqual("dedicated" in gpu.available, "dedicated" not in fallback)
+                    self.assertEqual("shared" in gpu.available, "shared" not in fallback)
+                    self.assertEqual(gpu.paged_available, not fallback)
+                s = snapshot()
+                s.vram_used = 512 * MiB
+                s.procs = [ProcRow(pid, f"app{pid}", "app", gpu, ProcDetail(pid, f"app{pid}"))
+                           for pid, gpu in processes[1].items()]
+                result = to_dict(s)
+                row = result["processes"][0]
+                self.assertEqual(row["vram_counter_source"], "Dedicated Usage" if "dedicated" in fallback else "Local Usage")
+                self.assertEqual(row["shared_counter_source"], "Shared Usage" if "shared" in fallback else "Non Local Usage")
+                self.assertEqual(row["vram_bytes"], None if "dedicated" in fallback else 512 * MiB)
+                self.assertEqual(row["shared_bytes"], None if "shared" in fallback else 0)
+                self.assertEqual(row["paged_out_bytes"], None if fallback else 512 * MiB)
+                self.assertEqual(result["attributed"], None if "dedicated" in fallback else GiB)
+                if fallback:
+                    self.assertIn("may include surfaces shared across processes", to_text(s))
+                else:
+                    self.assertNotIn("Windows fallback", to_text(s))
+
+    def test_fallback_keeps_attributed_unknown_without_live_rows(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(host_procs={}, fallback_counters={"dedicated"})
+        c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=512 * MiB, shared=0)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+        self.assertEqual(s.vram_used, 512 * MiB)
+        self.assertIsNone(s.attributed)
+        self.assertIn("may overlap", s.counter_status)
+
+    def test_missing_dedicated_counter_is_unknown_with_no_process_rows(self):
+        for selected in ("preferred", "fallback", "missing"):
+            with self.subTest(selected=selected):
+                def add(query, path, user, handle):
+                    preferred, fallback = GpuCounters._COUNTERS["dedicated"]
+                    if path == preferred and selected != "preferred":
+                        return 1
+                    if path == fallback and selected == "missing":
+                        return 1
+                    return 0
+
+                pdh = SimpleNamespace(PdhOpenQueryW=lambda *args: 0, PdhAddEnglishCounterW=add,
+                                      PdhCollectQueryData=lambda *args: 0)
+                data = {"a_dedicated": [("luid_0x0_0x1_phys_0", 512 * MiB)],
+                        "a_shared": [("luid_0x0_0x1_phys_0", 0)]}
+                with patch("gputaskman.pdh._load_pdh"), patch("gputaskman.pdh._pdh", pdh):
+                    counters = GpuCounters()
+                    self.assertEqual(counters.dedicated_counter_missing, selected == "missing")
+                    c = Collector.__new__(Collector)
+                    c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)
+                    c.adapters = [c.adapter]
+                    c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+                    c.nvml = Mock(ok=False)
+                    c.counters = counters
+                    c.inspector, c.prober = Mock(), Mock()
+                    with patch.object(counters, "_read", side_effect=lambda key: data.get(key, [])), \
+                            patch("gputaskman.collector.BACKEND", "wddm"):
+                        s = c.sample()
+                self.assertEqual(s.procs, [])
+                self.assertEqual(s.vram_used, 512 * MiB)
+                self.assertEqual(s.attributed, 0 if selected == "preferred" else None)
+                self.assertEqual("per-process dedicated memory counters are unavailable" in s.counter_status,
+                                 selected == "missing")
+                self.assertEqual(to_dict(s)["attributed"], s.attributed)
+
+    def test_missing_shared_counter_keeps_dedicated_attribution_and_explains_paged(self):
+        for selected in ("preferred", "fallback", "missing"):
+            with self.subTest(selected=selected):
+                def add(query, path, user, handle):
+                    preferred, fallback = GpuCounters._COUNTERS["shared"]
+                    if path == preferred and selected != "preferred":
+                        return 1
+                    if path == fallback and selected == "missing":
+                        return 1
+                    return 0
+
+                pdh = SimpleNamespace(PdhOpenQueryW=lambda *args: 0, PdhAddEnglishCounterW=add,
+                                      PdhCollectQueryData=lambda *args: 0)
+                name = "pid_42_luid_0x0_0x1_phys_0"
+                data = {"dedicated": [(name, 128 * MiB)],
+                        "shared": [(name, 0)] if selected != "missing" else [],
+                        "committed": [(name, 256 * MiB)],
+                        "engine": [(name + "_eng_0_engtype_Compute", 10)],
+                        "a_dedicated": [("luid_0x0_0x1_phys_0", 512 * MiB)],
+                        "a_shared": [("luid_0x0_0x1_phys_0", 0)]}
+                with patch("gputaskman.pdh._load_pdh"), patch("gputaskman.pdh._pdh", pdh):
+                    counters = GpuCounters()
+                    self.assertEqual(counters.shared_counter_missing, selected == "missing")
+                    c = Collector.__new__(Collector)
+                    c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)
+                    c.adapters = [c.adapter]
+                    c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+                    c.nvml = Mock(ok=False)
+                    c.counters = counters
+                    c.inspector, c.prober = Mock(), Mock()
+                    c.inspector.get.return_value = ProcDetail(42, "compute.exe")
+                    c.inspector.needs_scan.return_value = False
+                    with patch.object(counters, "_read", side_effect=lambda key: data.get(key, [])), \
+                            patch("gputaskman.collector.BACKEND", "wddm"):
+                        s = c.sample()
+                row = to_dict(s)["processes"][0]
+                self.assertEqual(s.attributed, 128 * MiB)
+                self.assertEqual(row["vram_bytes"], 128 * MiB)
+                self.assertEqual(row["gpu_pct"], 10)
+                self.assertEqual(row["shared_bytes"], 0 if selected == "preferred" else None)
+                self.assertEqual(row["paged_out_bytes"], 128 * MiB if selected == "preferred" else None)
+                self.assertEqual("per-process shared memory counters are unavailable" in s.counter_status,
+                                 selected == "missing")
+                if selected == "missing":
+                    self.assertIn("shared memory and Paged are unknown", to_text(s))
 
     def test_paged_is_clamped_commit_difference(self):
         gpu = ProcGpu(dedicated=100, shared=20, committed=150)
@@ -1156,6 +1358,28 @@ class PathArgumentTests(unittest.TestCase):
         # argv[0] may itself name a model-like executable; it is not an argument.
         self.assertEqual(_models_from_path_args(ProcDetail(123, cmdline=[str(self.path)])), [])
 
+    def test_unobserved_model_residency_is_unknown_but_measured_zero_is_preserved(self):
+        detail = self.detail("--model", self.path)
+        self.scan(detail)
+        self.assertIsNone(detail.models[0].resident)
+        s = snapshot()
+        s.procs[0].detail = detail
+        self.assertIsNone(to_dict(s)["processes"][0]["model_files"][0]["resident"])
+
+        measured = self.detail("--model", self.path)
+        self.scan(measured, [SimpleNamespace(path=str(self.path), rss=0)])
+        self.assertEqual(measured.models[0].resident, 0)
+        s.procs[0].detail = measured
+        self.assertEqual(to_dict(s)["processes"][0]["model_files"][0]["resident"], 0)
+
+    def test_api_only_model_has_unknown_residency(self):
+        detail = self.detail()
+        server = ServerInfo("llama-server", "http://local", model_path=str(self.path))
+        with patch("gputaskman.llm.read_gguf", return_value=gguf("qwen3", block_count=1)):
+            view = build_view(detail, GiB, 0, server)
+        self.assertEqual(view.files[0].sources, ["api"])
+        self.assertIsNone(view.files[0].resident)
+
     @unittest.skipIf(os.name == "nt", "POSIX resolves .. after following directory symlinks")
     def test_symlink_parent_traversal_is_not_rewritten_to_another_file(self):
         base, target = self.root / "base", self.root / "target"
@@ -1205,7 +1429,7 @@ class PathArgumentTests(unittest.TestCase):
         c.adapters = [c.adapter]
         c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
         c.nvml = Mock(ok=False)
-        c.counters = Mock(outside={})
+        c.counters = Mock(host_procs={})
         c.counters.sample.return_value = (
             {1: {123: ProcGpu(dedicated=8 * GiB, shared=0)}},
             {1: AdapterGpu(dedicated=8 * GiB, shared=0)})
@@ -1364,11 +1588,22 @@ class ModelTests(unittest.TestCase):
                 "llama_context: CUDA0 compute buffer size = 5 MiB\n",
                 encoding="utf-8",
             )
-            self.assertEqual(parse_load_log(str(path)), {
-                "CPU_Mapped": {"weights": 30 * MiB},
-                "CUDA0": {"weights": 100 * MiB, "kv": 30 * MiB, "compute": 5 * MiB},
-            })
-            self.assertIsNone(parse_load_log(str(path), not_before=path.stat().st_mtime + 10))
+            records = parse_load_log(str(path))
+            self.assertEqual([(r.device, r.kind, r.bytes // MiB) for r in records], [
+                ("CPU_Mapped", "weights", 30), ("CUDA0", "weights", 100), ("CUDA0", "kv", 20),
+                ("CUDA0", "kv", 10), ("CUDA0", "compute", 5),
+            ])
+            self.assertTrue(all(r.timestamp is None and r.timestamp_issue == "missing" for r in records))
+
+    def test_log_tail_does_not_read_old_or_partial_records(self):
+        prefix = b"2026-01-01T10:00:00Z load_tensors: "
+        clipped = b"CUDA0 model buffer size = 900 MiB\n"
+        latest = b"load_tensors: CPU model buffer size = 10 MiB\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_bytes(prefix + clipped + b"\n" * ((512 << 10) - len(clipped) - len(latest)) + latest)
+            records = parse_load_log(str(path))
+        self.assertEqual([(r.device, r.bytes, r.timestamp) for r in records], [("CPU", 10 * MiB, None)])
 
 
 def gguf(arch: str, **meta) -> GgufInfo:
@@ -1555,15 +1790,83 @@ class IdentityTests(unittest.TestCase):
              "size_bytes": 449, "loaded_instances": [{"id": "laya", "config": {"context_length": 8192}}]},
             {"type": "llm", "key": "idle", "loaded_instances": []},
         ]}
-        self.assertEqual(lmstudio_models(v1, None), [{"name": "laya", "type": "decision (laya)", "quant": "Q8_0",
-                                                      "ctx": 8192, "size": 449, "size_vram": None, "path": None}])
+        models, complete = lmstudio_models(v1, None)
+        self.assertEqual(models, [{"name": "laya", "type": "decision (laya)", "quant": "Q8_0",
+                                   "ctx": 8192, "size": 449, "size_vram": None, "path": None}])
+        self.assertTrue(complete)
         v0 = {"data": [{"id": "a", "type": "llm", "state": "loaded", "quantization": "Q4_K_M", "loaded_context_length": 4096},
                        {"id": "b", "state": "not-loaded"}]}
-        self.assertEqual([(m["name"], m["ctx"]) for m in lmstudio_models(None, v0)], [("a", 4096)])
+        models, complete = lmstudio_models(None, v0)
+        self.assertEqual([(m["name"], m["ctx"]) for m in models], [("a", 4096)])
+        self.assertTrue(complete)
         self.assertIsNone(lmstudio_models(None, None))
         llama = {"data": [{"id": r"C:\m\Laya-Q8_0.gguf", "architecture": {"output_modalities": ["decisions"]},
                            "meta": {"ftype": "Q8_0", "n_ctx": 8192, "size": 447}}]}
         self.assertEqual(llama_server_models(llama, r"C:\m\Laya-Q8_0.gguf")[0]["type"], "decision")
+
+    def test_runtime_api_parsers_skip_malformed_entries_and_nested_values(self):
+        llama = {"data": [None, "bad", {"id": "good", "architecture": None,
+                                         "meta": {"n_ctx": [], "size": {}}}]}
+        llama_models = llama_server_models(llama, None)
+        self.assertEqual([m["name"] for m in llama_models], ["good"])
+        self.assertEqual((llama_models[0]["ctx"], llama_models[0]["size"]), (None, None))
+
+        ollama = {"models": [None, 7, {"name": "good", "details": [], "size": 0, "size_vram": 0},
+                             {"name": "bad", "size": [], "size_vram": {}}]}
+        self.assertEqual(ollama_models(ollama), [
+            {"name": "good", "type": "llm", "quant": None, "ctx": None, "size": 0, "size_vram": 0, "path": None},
+            {"name": "bad", "type": "llm", "quant": None, "ctx": None, "size": None, "size_vram": None, "path": None},
+        ])
+
+        lmstudio = {"models": [
+            None,
+            {"key": "good", "quantization": [], "loaded_instances": [None, {"id": "good", "config": None}]},
+            {"key": "idle", "loaded_instances": None},
+        ]}
+        models, complete = lmstudio_models(lmstudio, None)
+        self.assertFalse(complete)
+        self.assertEqual(models, [
+            {"name": "good", "type": None, "quant": None, "ctx": None, "size": None, "size_vram": None, "path": None}
+        ])
+        models, complete = lmstudio_models(None, {"data": [None, {"state": "loaded", "id": "good"}]})
+        self.assertFalse(complete)
+        self.assertEqual(models, [
+            {"name": "good", "type": None, "quant": None, "ctx": None, "size": None, "size_vram": None, "path": None}
+        ])
+
+    def test_malformed_llama_server_response_does_not_stop_probe(self):
+        with patch("gputaskman.llm._get", side_effect=[
+                {"model_path": [], "default_generation_settings": None, "n_ctx": [], "total_slots": {}},
+                {"data": []},
+                [{"is_processing": True}, None, 7, {"is_processing": False}],
+                None,
+        ]):
+            server = probe_server(8080)
+        self.assertEqual(server.kind, "llama-server")
+        self.assertIsNone(server.n_ctx)
+        self.assertEqual(server.models, [])
+        self.assertEqual((server.slots_total, server.slots_busy, server.requests_running), (None, None, None))
+
+    def test_llama_server_slots_require_complete_boolean_statuses(self):
+        props = {"model_path": None, "total_slots": 8}
+        cases = (
+            ("null entry", [None], (8, None, None)),
+            ("mixed entries", [{"is_processing": True}, None], (8, None, None)),
+            ("missing status", [{}], (8, None, None)),
+            ("invalid status", [{"is_processing": "false"}], (8, None, None)),
+            ("empty list", [], (0, 0, 0)),
+        )
+        for label, slots, expected in cases:
+            with self.subTest(label=label), patch("gputaskman.llm._get",
+                    side_effect=[props, {"data": []}, slots, None]):
+                server = probe_server(8080)
+            self.assertEqual((server.slots_total, server.slots_busy, server.requests_running), expected)
+
+        metrics = "llamacpp:requests_processing 3\nllamacpp:requests_deferred 2"
+        with patch("gputaskman.llm._get", side_effect=[props, {"data": []}, [None], metrics]):
+            server = probe_server(8080)
+        self.assertEqual((server.slots_total, server.slots_busy, server.requests_running, server.requests_waiting),
+                         (8, None, 3, 2))
 
     def test_api_key_from_launch_arguments(self):
         self.assertEqual(api_key(["llama-server", "--api-key", "abc"]), "abc")
@@ -1866,26 +2169,100 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual([s.label for s in v.segments], ["weights", "compute buffers + runtime"])
         self.assertTrue(any("laya decision model" in n for n in v.notes))
 
-    def test_vulkan_log_does_not_label_unknown_overhead_as_cuda(self):
-        laya = gguf("modern-bert", **LAYA)
-        detail = ProcDetail(5, "llama-server.exe", models=[
-            MappedModel("laya.gguf", 1000, 0, True, kind="decision model")
-        ])
+    def test_unrelated_append_does_not_revive_old_load_log_block(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "server.log"
             path.write_text(
-                "load_tensors: Vulkan0 model buffer size = 10 MiB\n"
-                "load_tensors: Vulkan_Host model buffer size = 3 MiB\n"
-                "llama_context: Vulkan0 compute buffer size = 2 MiB\n",
+                "2026-01-01T10:00:00Z load_tensors: CUDA0 model buffer size = 900 MiB\n"
+                "2026-02-01T10:00:00Z unrelated startup event\n"
+                "2026-02-01T10:00:01Z llama_context: CUDA0 compute buffer size = 900 MiB\n"
+                "llama_context: CUDA0 KV buffer size = 800 MiB\n",
+                encoding="utf-8",
+            )
+            detail = ProcDetail(5, "llama-server.exe",
+                                create_time=datetime(2026, 1, 2, 9, tzinfo=timezone.utc).timestamp())
+            view = build_view(detail, 20 * MiB, 0, None, str(path))
+        self.assertFalse(any(s.exact or "CUDA0" in s.label for s in view.segments))
+        s = snapshot()
+        s.procs[0] = ProcRow(detail.pid, detail.name, classify(detail, {}), ProcGpu(dedicated=20 * MiB), detail, view)
+        history = to_dict(s)["processes"][0]["llm"]["log_history"]
+        self.assertEqual([(r["kind"], r["bytes"], r["timestamp"]) for r in history], [
+            ("weights", 900 * MiB, "2026-01-01T10:00:00Z"),
+            ("compute", 900 * MiB, "2026-02-01T10:00:01Z"),
+            ("kv", 800 * MiB, None),
+        ])
+        text = to_text(s)
+        self.assertIn("Load-log history (runtime-reported; not current residency or allocation)", text)
+        self.assertIn("CUDA0 weights: 900 MiB at 2026-01-01T10:00:00Z (predates this process)", text)
+        self.assertIn("CUDA0 compute: 900 MiB at 2026-02-01T10:00:01Z", text)
+        self.assertIn("CUDA0 kv: 800 MiB at timestamp unavailable", text)
+
+    def test_newer_load_log_is_preserved_as_history_not_current_allocation(self):
+        laya = gguf("modern-bert", **LAYA)
+        detail = ProcDetail(5, "llama-server.exe",
+                            create_time=datetime(2026, 1, 2, 9, tzinfo=timezone.utc).timestamp(),
+                            models=[MappedModel("laya.gguf", 1000, 0, True, kind="decision model")])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text(
+                "2026-01-02T10:00:00Z load_tensors: Vulkan0 model buffer size = 10 MiB\n"
+                "2026-01-02T10:00:01Z load_tensors: Vulkan_Host model buffer size = 3 MiB\n"
+                "2026-01-02T10:00:02Z llama_context: Vulkan0 compute buffer size = 2 MiB\n",
                 encoding="utf-8",
             )
             with patch("gputaskman.llm.read_gguf", return_value=laya):
                 view = build_view(detail, 20 * MiB, 0, None, str(path))
-        self.assertEqual([(s.label, s.bytes) for s in view.segments], [
-            ("weights (Vulkan0)", 10 * MiB),
-            ("compute buffers (Vulkan0)", 2 * MiB),
-            ("runtime and other overhead", 8 * MiB),
-        ])
+        self.assertFalse(any(s.exact for s in view.segments))
+        self.assertFalse(any("Vulkan0" in s.label for s in view.segments))
+        s = snapshot()
+        s.procs[0] = ProcRow(detail.pid, detail.name, classify(detail, {}), ProcGpu(dedicated=20 * MiB), detail, view)
+        event = to_dict(s)["processes"][0]["llm"]["log_history"][0]
+        self.assertEqual(event, {"device": "Vulkan0", "kind": "weights", "bytes": 10 * MiB,
+                                 "timestamp": "2026-01-02T10:00:00Z", "timestamp_issue": None})
+
+    def test_untimestamped_load_log_is_not_attributed_to_current_process(self):
+        detail = ProcDetail(5, "llama-server.exe",
+                            create_time=datetime(2026, 1, 2, 9, tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text("load_tensors: CUDA0 model buffer size = 10 MiB\n", encoding="utf-8")
+            view = build_view(detail, 20 * MiB, 0, None, str(path))
+        self.assertEqual(view.log[0].bytes, 10 * MiB)
+        self.assertIsNone(view.log[0].timestamp)
+        self.assertFalse(any(s.exact or "CUDA0" in s.label for s in view.segments))
+
+    def test_timezone_free_load_log_timestamp_is_not_compared_to_process_start(self):
+        detail = ProcDetail(5, "llama-server.exe",
+                            create_time=datetime(2026, 1, 3, 9, tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text("2026-01-02T10:00:00 load_tensors: CUDA0 model buffer size = 10 MiB\n",
+                            encoding="utf-8")
+            view = build_view(detail, 20 * MiB, 0, None, str(path))
+        record = view.log[0]
+        self.assertEqual(record.timestamp, "2026-01-02T10:00:00")
+        self.assertIsNone(record.timestamp_epoch)
+        self.assertEqual(record.timestamp_issue, "timezone-unknown")
+        s = snapshot()
+        s.procs[0] = ProcRow(detail.pid, detail.name, classify(detail, {}), ProcGpu(dedicated=20 * MiB), detail, view)
+        text = to_text(s)
+        self.assertNotIn("predates this process", text)
+        self.assertIn("2026-01-02T10:00:00 (has no timezone)", text)
+
+    def test_unrepresentable_log_timestamps_remain_history(self):
+        detail = ProcDetail(5, "llama-server.exe",
+                            create_time=datetime(2026, 1, 2, 9, tzinfo=timezone.utc).timestamp())
+        for timestamp in ("0001-01-01T00:00:00", "9999-12-31T23:59:59"):
+            with self.subTest(timestamp=timestamp), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "server.log"
+                path.write_text(f"{timestamp}Z load_tensors: CUDA0 model buffer size = 10 MiB\n",
+                                encoding="utf-8")
+                with patch("gputaskman.llm._datetime_epoch", side_effect=OSError("unsupported timestamp")):
+                    view = build_view(detail, 20 * MiB, 0, None, str(path))
+                record = view.log[0]
+                self.assertEqual(record.timestamp, f"{timestamp}Z")
+                self.assertIsNone(record.timestamp_epoch)
+                self.assertEqual(record.timestamp_issue, "unrepresentable")
 
     def test_installed_models_are_candidates_only(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1904,6 +2281,7 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual([(os.path.basename(m.path), m.size) for m in found],
                              [("whisper-large.bin", 70 * MiB), ("parakeet", 13 * MiB)])
             self.assertEqual(found[0].evidence, "installed, not proven loaded")
+            self.assertTrue(all(m.resident is None for m in found))
             self.assertIs(installed_models(str(exe), now=2.0), found)  # cached
             d = ProcDetail(7, "speechy.exe", runtimes=["ONNX RT"], candidates=found)
             self.assertEqual(classify(d, {}), "AI")  # candidates never decide the kind
@@ -1935,6 +2313,66 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(view.files[0].sources, ["cmdline", "api"])
         self.assertEqual(model.sources, ["cmdline"])
 
+    def test_lmstudio_instance_without_an_identifier_does_not_correlate_a_model(self):
+        models, complete = lmstudio_models({"models": [
+            {"key": [], "loaded_instances": [{"id": []}]},
+        ]}, None)
+        self.assertFalse(complete)
+        self.assertEqual(models, [])
+        models, complete = lmstudio_models(None, {"data": [{"state": "loaded"}]})
+        self.assertFalse(complete)
+        self.assertEqual(models, [])
+        model = MappedModel("m.gguf", 1000, 0, True, ["mapped"], kind="LLM")
+        detail = ProcDetail(6, "llama-server.exe", models=[model])
+        host = ServerInfo("lmstudio", "http://127.0.0.1:1", models=models)
+        with patch("gputaskman.llm.read_gguf", return_value=gguf("qwen3", block_count=1)):
+            view = build_view(detail, GiB, 0, None, host=host)
+        self.assertEqual(view.files[0].sources, ["mapped"])
+
+    def test_lmstudio_incomplete_loaded_list_cannot_correlate_as_singleton(self):
+        response = {"models": [
+            {"key": "qwen3", "type": "llm", "loaded_instances": [{"id": "qwen3"}]},
+            {"key": "other", "type": "llm", "loaded_instances": [None]},
+        ]}
+        with patch("gputaskman.llm._get", side_effect=[None, None, response]):
+            server = probe_server(8080)
+        self.assertEqual([model["name"] for model in server.models], ["qwen3"])
+        self.assertFalse(server.models_complete)
+
+        model = MappedModel("m.gguf", 1000, 0, True, ["mapped"], kind="LLM")
+        detail = ProcDetail(6, "llama-server.exe", models=[model])
+        with patch("gputaskman.llm.read_gguf", return_value=gguf("qwen3", block_count=1)):
+            view = build_view(detail, GiB, 0, server)
+        self.assertEqual(view.files[0].sources, ["mapped"])
+        snap = snapshot()
+        snap.procs[0].llm = view
+        server_json = to_dict(snap)["processes"][0]["llm"]["server"]
+        self.assertNotIn("models_complete", server_json)
+        self.assertIn("slots=n/a/n/a", to_text(snap))
+
+    def test_lmstudio_complete_singleton_can_correlate_one_mapped_model(self):
+        response = {"models": [
+            {"key": "qwen3", "type": "llm", "loaded_instances": [{"id": "qwen3"}]},
+        ]}
+        with patch("gputaskman.llm._get", side_effect=[None, None, response]):
+            server = probe_server(8080)
+        self.assertTrue(server.models_complete)
+        model = MappedModel("m.gguf", 1000, 0, True, ["mapped"], kind="LLM")
+        detail = ProcDetail(6, "llama-server.exe", models=[model])
+        with patch("gputaskman.llm.read_gguf", return_value=gguf("qwen3", block_count=1)):
+            view = build_view(detail, GiB, 0, server)
+        self.assertEqual(view.files[0].sources, ["mapped", "api"])
+
+    def test_ollama_unknown_vram_usage_is_not_rendered_as_zero(self):
+        for size_vram, expected in ((None, "n/a"), ([], "n/a"), (0, "0%"), (GiB, "100%")):
+            with self.subTest(size_vram=size_vram):
+                models = ollama_models({"models": [{"name": "qwen3:14b", "size": GiB,
+                                                    "size_vram": size_vram}]})
+                host = ServerInfo("ollama", "http://127.0.0.1:1", models=models)
+                view = build_view(ProcDetail(6, "ollama.exe"), GiB, 0, None, host=host)
+                note = next(n for n in view.notes if n.startswith("Ollama"))
+                self.assertIn(f"{expected} on GPU", note)
+
 
 class ChartTests(unittest.TestCase):
     def test_spark_distinguishes_zero_from_missing_and_clamps_values(self):
@@ -1963,7 +2401,7 @@ class LlmWantedTests(unittest.TestCase):
             kind=kind,
             detail=ProcDetail(123, cmdline=["--diffusion-model"] if diffusion else [],
                               models=[MappedModel(m, 1, 0, True) for m in models]),
-            gpu=SimpleNamespace(available=set(available)),
+            gpu=ProcGpu(available=set(available)),
         )
 
     def test_spill_backend_needs_both_counters(self):
@@ -2022,6 +2460,47 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("llama-server (runtime-reported): requests running 0, waiting 0, "
                               "KV-cache pool 0.0%", text)
                 self.assertIn("not of GPU memory", text)
+
+    async def test_inspector_displays_buffer_values_only_in_log_history(self):
+        snap = snapshot()
+        row = snap.procs[0]
+        row.detail.create_time = datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text(
+                'time=2026-01-01T10:00:00Z level=INFO msg="model weights" device=CUDA0 size="900 MiB"\n'
+                'time=2026-02-01T10:00:00Z level=INFO msg="server started"\n'
+                'msg="compute graph" device=CUDA0 size="20 MiB"\n',
+                encoding="utf-8",
+            )
+            row.llm = build_view(row.detail, row.gpu.dedicated, row.gpu.shared, None, str(path))
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(180, 50)) as pilot:
+                app.apply(snap)
+                await pilot.pause()
+                text = "\n".join(getattr(line, "plain", "") for line in
+                                 app.query_one("#inspector", Static).content.renderables)
+                before, after = text.split("Load-log history (runtime-reported; not current residency or allocation)")
+                self.assertNotIn("CUDA0", before)
+                self.assertIn("CUDA0 weights: 900 MiB at 2026-01-01T10:00:00Z (predates this process)", after)
+                self.assertIn("CUDA0 compute: 20 MiB at timestamp unavailable", after)
+
+    async def test_inspector_labels_unknown_busy_slots_when_total_is_known(self):
+        snap = snapshot()
+        row = snap.procs[0]
+        server = ServerInfo("llama-server", "http://127.0.0.1:8080", slots_total=4)
+        row.llm = build_view(row.detail, row.gpu.dedicated, row.gpu.shared, server)
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(180, 50)) as pilot:
+                app.apply(snap)
+                await pilot.pause()
+                text = "\n".join(getattr(line, "plain", "") for line in
+                                 app.query_one("#inspector", Static).content.renderables)
+                self.assertIn("slots busy n/a/4", text)
 
     async def test_monitoring_toggle_hides_diagnostics_without_changing_live_state(self):
         s = snapshot()
@@ -2191,6 +2670,38 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("compute 65%", hdr)
                 self.assertIn("shared(RAM) n/a", hdr)
 
+    async def test_container_guess_keeps_host_measurement_separate_in_ui(self):
+        s = snapshot()
+        s.backend = "nvml"
+        local = ProcGpu(attributed=False, inferred=3 * GiB, inferred_by="order", available=set(),
+                        engine_reason="NVML engines are measured for a host PID; its local owner is unresolved.")
+        detail = ProcDetail(10, "python3", models=[MappedModel("m.gguf", GiB, None, True)])
+        with patch("gputaskman.llm.read_gguf",
+                   return_value=GgufInfo("m.gguf", GiB, 3, tensor_bytes=GiB)):
+            view = build_view(detail, 0, 0, None, attributed=False)
+        s.procs = [ProcRow(10, "python3", "AI", local, detail, view),
+                   ProcRow(9000, "(unresolved host PID)", "external",
+                           ProcGpu(dedicated=3 * GiB, engines={"compute": 75}),
+                           ProcDetail(9000, "(unresolved host PID)"), host=True, origin="nvml")]
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.BACKEND", "nvml"), \
+                patch("gputaskman.app.stacked_bar", wraps=stacked_bar) as bar:
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(220, 50)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                table = app.query_one("#procs")
+                self.assertEqual(table.get_cell("10", "VRAM").plain, "3.00 GB?")
+                self.assertEqual(table.get_cell("10", "GPU%").plain, "n/a")
+                self.assertEqual(table.get_cell("n9000", "VRAM").plain, "3.00 GB")
+                self.assertEqual(table.get_cell("n9000", "GPU%").plain, "75")
+                text = "\n".join(getattr(line, "plain", "") for line in
+                                 app.query_one("#inspector", Static).content.renderables)
+                self.assertIn("local owner is unresolved", text)
+                self.assertIn("VRAM total is unknown", text)
+                self.assertEqual(bar.call_args.args[1], GiB)  # estimates, not the guessed 3 GiB budget
+                self.assertEqual(s.attributed, 3 * GiB)
+
     async def test_unknown_process_memory_preserves_unattributed_adapter_usage(self):
         s = snapshot()
         s.procs[0].gpu.dedicated = 2 * GiB
@@ -2204,6 +2715,26 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIsNone(s.attributed)
                 self.assertTrue(any((6 * GiB, "grey35") in call.args[0] for call in bar.call_args_list))
+
+    async def test_windows_fallback_is_explained_without_attribution(self):
+        s = snapshot()
+        s.vram_used = 512 * MiB
+        gpu = ProcGpu(available={"committed", "engine"}, committed=GiB,
+                      engines={"3d": 20}, wddm_dedicated_usage=512 * MiB,
+                      wddm_shared_usage=0)
+        s.procs = [ProcRow(10, "dwm.exe", "compositor", gpu, ProcDetail(10, "dwm.exe"))]
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.stacked_bar", wraps=stacked_bar) as bar:
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(180, 42)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                table = app.query_one("#procs")
+                self.assertEqual(table.get_cell("10", "VRAM").plain, "n/a")
+                self.assertEqual(table.get_cell("10", "GPU%").plain, "20")
+                content = app.query_one("#inspector", Static).content.renderables
+                self.assertIn("Dedicated Usage", " ".join(str(x) for x in content))
+                self.assertTrue(any((512 * MiB, "grey35") in call.args[0] for call in bar.call_args_list))
 
     async def test_eighth_chart_records_sm_clock_with_scale_and_missing_readings(self):
         with patch.object(GpuTaskManager, "poll"):
@@ -2237,6 +2768,43 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(list(app.hist_clock), [1500, 0, None, None])
                 app.hist_clock.clear()
                 self.assertEqual(app.chart_series(index, None)[1], 1)
+
+    async def test_intel_gt_clock_labels_update_with_selected_gpu(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(117, 59)) as pilot:
+                index = app.CHARTS.index("SM clock")
+                selector = app.query_one("#chart-mode", Select)
+                selector.value = index
+
+                intel = snapshot()
+                intel.adapter = Adapter(0, "Intel GPU", 0x8086, 8 * GiB, 0, False)
+                intel.nv = NvDevice(index=0, source="Intel sysfs", sm_clock=1200, sm_clock_max=2400)
+                app.apply(intel)
+                await pilot.pause()
+                self.assertEqual(next(label for label, value in selector._options if value == index), "GT clock")
+                self.assertIn("GT 1200/2400 MHz", "\n".join(
+                    line.plain for line in app.render_device(intel).renderables))
+                self.assertIn("GT clock", self.chart_text(app))
+                self.assertIn("GT clock 0–2400 MHz", str(app.query_one("#chart-note", Static).content))
+
+                amd = snapshot()
+                amd.adapter = Adapter(1, "AMD GPU", 0x1002, 8 * GiB, 0, False)
+                amd.nv = NvDevice(index=1, source="AMD sysfs", gfx_clock=900, sm_clock_max=1800)
+                app.apply(amd)
+                await pilot.pause()
+                self.assertEqual(next(label for label, value in selector._options if value == index), "GFX clock")
+                self.assertIn("GFX clock", self.chart_text(app))
+                self.assertIn("GFX clock 0–1800 MHz", str(app.query_one("#chart-note", Static).content))
+
+                nvidia = snapshot()
+                nvidia.adapter = Adapter(2, "NVIDIA GPU", 0x10DE, 8 * GiB, 0, False)
+                nvidia.nv = NvDevice(index=2, source="NVML", sm_clock=1500, sm_clock_max=3000)
+                app.apply(nvidia)
+                await pilot.pause()
+                self.assertEqual(next(label for label, value in selector._options if value == index), "SM clock")
+                self.assertIn("SM clock", self.chart_text(app))
+                self.assertIn("SM clock 0–3000 MHz", str(app.query_one("#chart-note", Static).content))
 
     async def test_row_highlight_after_the_inspector_is_gone_is_ignored(self):
         # During teardown a queued RowHighlighted can arrive after the inspector was removed
